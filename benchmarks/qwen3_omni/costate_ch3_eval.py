@@ -210,7 +210,8 @@ class CoStateEvalWorker(GPUARWorker):
 
 def build_scaled_body(tag: str, target_tokens: int) -> str:
     base_facts = helpers._FACTS
-    needed_facts = max(1, int(target_tokens / 26.0))
+    # "[tag-SN-FM] {fact}" tokenizes to ~34-35 tokens under Qwen3-Omni tokenizer.
+    needed_facts = max(1, int(target_tokens / 35.0))
     pieces = []
     for idx in range(needed_facts):
         fact = base_facts[idx % len(base_facts)]
@@ -446,14 +447,14 @@ def build_e2e_serving_trace(seed: int = 42) -> list[dict]:
     - 60% Audio-output turns + 40% Text-only turns sharing prefixes
     """
     rng = random.Random(seed)
-    # 8 session specs: (root_id, branch_id, branch_extra_toks, weight)
+    # 8 session specs: (root_id, branch_id, branch_extra_toks, weight) -> sum(weights) == 45
     families = [
-        ("sysA", "sess0", 1024, 7),
-        ("sysA", "sess1", 1024, 6),
-        ("sysA", "sess2", 2560, 5),
-        ("sysB", "sess3", 1024, 6),
-        ("sysB", "sess4", 2560, 5),
-        ("sysB", "sess5", 1024, 3),
+        ("sysA", "sess0", 1024, 9),
+        ("sysA", "sess1", 1024, 8),
+        ("sysA", "sess2", 2560, 7),
+        ("sysB", "sess3", 1024, 7),
+        ("sysB", "sess4", 2560, 6),
+        ("sysB", "sess5", 1024, 4),
         ("sysA", "sess6", 2560, 2),
         ("sysB", "sess7", 2560, 2),
     ]
@@ -462,8 +463,8 @@ def build_e2e_serving_trace(seed: int = 42) -> list[dict]:
     for root_id, branch_id, extra_toks, count in families:
         for _ in range(count):
             hot_pool.append((root_id, branch_id, extra_toks, 0))
+    assert len(hot_pool) == 45
     rng.shuffle(hot_pool)
-    hot_pool = hot_pool[:45]
 
     noise_specs = [
         ("noise4k", 4096) if i % 3 != 0 else ("noise8k", 8192)
