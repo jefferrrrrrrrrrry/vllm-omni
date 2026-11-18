@@ -115,6 +115,8 @@ def _lookup_queue_drained() -> None:
 class JointStoreWorker(MooncakeStoreWorker):
     """Use the existing lookup RPC to return joint, contiguous availability."""
 
+    enable_costate: bool = False
+
     def __init__(
         self,
         config: VllmConfig,
@@ -298,6 +300,10 @@ class JointMetadata(MooncakeStoreConnectorMetadata):
 
 class OmniMooncakeStoreConnector(MooncakeStoreConnector):
     """Opt-in TP=1 full-attention adapter. All reads precede computation."""
+
+    _costate_dir: UnifiedPrefixDirectory | None = None
+    _cost_gate: OnlineCostGate | None = None
+    _host_hs_cache: HostHSCache | None = None
 
     def __init__(
         self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None
@@ -616,9 +622,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         super().update_connector_output(connector_output)
+        ext_loaded = getattr(self, "_ext_loaded_reqs", None)
         for req_id in connector_output.failed_recving or ():
             self._bypass.add(req_id)
-            self._ext_loaded_reqs.discard(req_id)
+            if ext_loaded is not None:
+                ext_loaded.discard(req_id)
             if self._cost_gate is not None:
                 self._cost_gate.release_read(req_id)
         for req_id in connector_output.finished_recving or ():
@@ -628,7 +636,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 continue
             # Rotate only after native copies drain and recovery can run.
             self._scheduler_attempts.pop(req_id, None)
-        if self.settings.enable_costate and self._costate_dir is not None and self._cost_gate is not None:
+        if getattr(self.settings, "enable_costate", False) and self._costate_dir is not None and self._cost_gate is not None:
             wmeta = connector_output.kv_connector_worker_meta
             if isinstance(wmeta, CoStateWorkerMetadata):
                 self._costate_dir.reconcile_worker_meta(wmeta)
@@ -768,12 +776,16 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> JointMetadata:
         retired = set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ())
+        active_plans = getattr(self, "_active_req_plans", None)
+        ext_loaded = getattr(self, "_ext_loaded_reqs", None)
         for req_id in retired:
             self._scheduler_attempts.pop(req_id, None)
             self._lookup_started.pop(req_id, None)
             self._bypass.discard(req_id)
-            self._active_req_plans.pop(req_id, None)
-            self._ext_loaded_reqs.discard(req_id)
+            if active_plans is not None:
+                active_plans.pop(req_id, None)
+            if ext_loaded is not None:
+                ext_loaded.discard(req_id)
             if self._cost_gate is not None:
                 self._cost_gate.release_read(req_id)
                 self._cost_gate.release_save(req_id)
@@ -783,7 +795,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
         step_plans: dict[str, CoStateReqPlan] = {}
         evict_batch: list[bytes] = []
-        if self.settings.enable_costate and isinstance(self.connector_scheduler, CoStateStoreScheduler):
+        if getattr(self.settings, "enable_costate", False) and isinstance(self.connector_scheduler, CoStateStoreScheduler):
             step_plans = self._prepare_costate_step_plans(scheduler_output)
             if self._pending_evict_hashes:
                 evict_batch = list(dict.fromkeys(self._pending_evict_hashes))
