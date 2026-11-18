@@ -254,6 +254,11 @@ def stage_prefix_cache_config(
         return None
     if model_cache_policy.native_kv_cache_only:
         return None
+    if getattr(kv_transfer_config, "kv_connector", None) == "OmniMooncakeStoreConnector":
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        mc_cfg = extra.get("omni_mooncake") if isinstance(extra, dict) else None
+        if isinstance(mc_cfg, dict) and mc_cfg.get("enable_costate") and mc_cfg.get("enable_local_tier"):
+            return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)
     check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))

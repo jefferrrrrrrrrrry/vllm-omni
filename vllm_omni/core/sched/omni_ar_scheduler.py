@@ -782,6 +782,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _get_local_prefix_cache_hit(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[Any, int, int, bool]:
+        connector = getattr(self, "connector", None)
+        cap_fn = getattr(connector, "cap_local_prefix_cache_hit", None)
+        if callable(cap_fn):
+            max_cache_hit_length = cap_fn(request, max_cache_hit_length)
+            if max_cache_hit_length is not None and max_cache_hit_length <= 0:
+                return self.kv_cache_manager.empty_kv_cache_blocks, 0, 0, False
+        return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows

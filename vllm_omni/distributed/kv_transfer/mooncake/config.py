@@ -17,6 +17,9 @@ CONNECTOR_MODULE = "vllm_omni.distributed.kv_transfer.mooncake.connector"
 EXTRA_CONFIG_KEY = "omni_mooncake"
 
 
+VALID_EVICTION_POLICIES = frozenset({"none", "coupled_lru", "topo_lru", "costate_utility"})
+
+
 @dataclass(frozen=True)
 class MooncakeConfig:
     """Explicit cache identity and bounded temporary HS resources.
@@ -33,16 +36,41 @@ class MooncakeConfig:
     max_hs_bytes: int = 256 * 1024 * 1024
     max_pending_transfers: int = 16
     load_timeout_seconds: float = 30.0
+    # CoState modular switches (defaults keep vanilla #10107 behavior unchanged)
+    enable_costate: bool = False
+    enable_local_tier: bool = False
+    enable_modality_decouple: bool = False
+    enable_cost_gate: bool = False
+    min_write_hits: int = 1
+    eviction_policy: str = "none"
+    sync_write_truncation: bool = False
+    max_store_bytes: int = 0
+    host_hs_cache_bytes: int = 256 * 1024 * 1024
 
     def __post_init__(self) -> None:
         for name in ("config_file", "namespace", "model_revision"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"mooncake_config.{name} must be a nonempty string")
-        for name in ("max_hs_bytes", "max_pending_transfers"):
+        for name in ("max_hs_bytes", "max_pending_transfers", "min_write_hits", "host_hs_cache_bytes"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"mooncake_config.{name} must be a positive integer")
+        if isinstance(self.max_store_bytes, bool) or not isinstance(self.max_store_bytes, int) or self.max_store_bytes < 0:
+            raise ValueError("mooncake_config.max_store_bytes must be a nonnegative integer")
+        for flag in (
+            "enable_costate",
+            "enable_local_tier",
+            "enable_modality_decouple",
+            "enable_cost_gate",
+            "sync_write_truncation",
+        ):
+            if not isinstance(getattr(self, flag), bool):
+                raise ValueError(f"mooncake_config.{flag} must be a boolean")
+        if self.eviction_policy not in VALID_EVICTION_POLICIES:
+            raise ValueError(
+                f"mooncake_config.eviction_policy must be one of {sorted(VALID_EVICTION_POLICIES)}"
+            )
         timeout = self.load_timeout_seconds
         if (
             isinstance(timeout, bool)
