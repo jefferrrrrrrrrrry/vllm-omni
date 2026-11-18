@@ -222,8 +222,11 @@ class DiagnosticGPUARWorker(GPUARWorker):
 def build_scaled_prompt(document: str, target_tokens: int) -> dict:
     """Build deterministic factual prompt scaled to ~target_tokens."""
     base_facts = helpers._FACTS
-    # ~18-20 tokens per fact sentence; scale deterministically to hit target_tokens
-    needed_facts = max(24, int(target_tokens / 17.2))
+    # Each "Section N Fact M: {fact}" piece tokenizes to ~26 tokens under the
+    # Qwen3-Omni tokenizer (fact sentence ~20 + "Section N Fact M:" prefix ~6).
+    # The prior 17.2 estimate overshot ~1.5x and pushed the 8192 tier past
+    # max_model_len; scale so the prompt lands near target_tokens instead.
+    needed_facts = max(1, int(target_tokens / 26.0))
     pieces = []
     for idx in range(needed_facts):
         fact = base_facts[idx % len(base_facts)]
@@ -467,7 +470,18 @@ async def run_benchmark(args):
             # Give best-effort background save threads a brief moment to record stats for this wave
             await asyncio.sleep(0.2)
             snaps = await omni.collective_rpc("costate_diag_snapshot", stage_ids=[0])
-            diag = snaps[0]["diag"] if snaps else {}
+            # collective_rpc returns one entry per replica; each replica result
+            # is a per-TP-rank list of worker snapshot dicts (a list even at TP=1).
+            snapshot = next(
+                (
+                    item
+                    for entry in (snaps or [])
+                    for item in (entry if isinstance(entry, list) else [entry])
+                    if isinstance(item, dict) and "diag" in item
+                ),
+                {},
+            )
+            diag = snapshot.get("diag") or {}
             diag_summary = {
                 k: stats_dict(v) if isinstance(v, list) and (not v or isinstance(v[0], (int, float))) else v
                 for k, v in diag.items()
