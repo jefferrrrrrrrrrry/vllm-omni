@@ -515,6 +515,7 @@ class OmniEngineBase:
             )
             if self._weight_sharing_config is not None:
                 orchestrator.weight_sharing = self._runtime.sharing
+            self.orchestrator = orchestrator
             await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

@@ -456,24 +456,51 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._stagepace_cfg = StagePaceConfig.from_vllm_config(self.vllm_config)
         self._stagepace_req_meta: dict[str, StagePaceReqMeta] = {}
         self._stagepace_ready_ts: dict[str, float] = {}
+        self._stagepace_seen_hashes: set[bytes] = set()
         stage_id = int(getattr(self.vllm_config.model_config, "stage_id", 0) or 0)
+        self._stagepace_stage_id = stage_id
         self._stagepace_ctrl: SlackBatchController | None = (
             SlackBatchController(self._stagepace_cfg)
-            if (self._stagepace_cfg.enabled and self._stagepace_cfg.enable_talker_slack_coalesce and stage_id > 0)
+            if (
+                self._stagepace_cfg.enabled
+                and (
+                    self._stagepace_cfg.enable_work_aware_reorder
+                    or (self._stagepace_cfg.enable_talker_slack_coalesce and stage_id > 0)
+                )
+            )
             else None
         )
         if self._stagepace_ctrl is not None:
             logger.info(
-                "StagePace Stage-%d Talker slack coalescing enabled: target=%d, max_wait=%.1f ms, min_slack=%.1f ms",
+                "StagePace Stage-%d AR scheduler enabled: work_reorder=%s talker_coalesce=%s",
                 stage_id,
-                self._stagepace_cfg.talker_min_batch,
-                self._stagepace_cfg.talker_max_wait_ms,
-                self._stagepace_cfg.talker_min_defer_slack_ms,
+                self._stagepace_cfg.enable_work_aware_reorder,
+                bool(self._stagepace_cfg.enable_talker_slack_coalesce and stage_id > 0),
             )
+
+    def _reorder_waiting_by_stagepace(self) -> None:
+        ctrl = getattr(self, "_stagepace_ctrl", None)
+        if ctrl is None or not self._stagepace_cfg.enable_work_aware_reorder or len(self.waiting) <= 1:
+            return
+        waiting_list = list(self.waiting)
+        stage_id = int(getattr(self, "_stagepace_stage_id", 0) or 0)
+        bsize = int(getattr(getattr(self, "cache_config", None), "block_size", 16) or 16)
+        ordered = ctrl.order_waiting_requests(
+            waiting_list,
+            stage_id=stage_id,
+            seen_hashes=self._stagepace_seen_hashes,
+            block_size=bsize,
+            is_stage_zero_final_fn=self._request_is_stage_zero_final if stage_id == 0 else None,
+            ready_ts_map=self._stagepace_ready_ts,
+        )
+        if any(a is not b for a, b in zip(ordered, waiting_list)):
+            self.waiting.remove_requests(ordered)
+            self.waiting.prepend_requests(ordered)
 
     def _should_defer_waiting_admission(self) -> bool:
         ctrl = getattr(self, "_stagepace_ctrl", None)
-        if ctrl is not None:
+        stage_id = int(getattr(self, "_stagepace_stage_id", 0) or 0)
+        if ctrl is not None and stage_id > 0 and self._stagepace_cfg.enable_talker_slack_coalesce:
             waiting_list = list(self.waiting)
             if not waiting_list:
                 return False
@@ -869,8 +896,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         sp_ctrl = getattr(self, "_stagepace_ctrl", None)
-        original_wait_queues = None
         if sp_ctrl is not None:
+            self._reorder_waiting_by_stagepace()
+        original_wait_queues = None
+        if sp_ctrl is not None and int(getattr(self, "_stagepace_stage_id", 0) or 0) > 0:
             # StagePace Mechanism 2: evaluate waiting deferral BEFORE Talker K-frame
             # guard so deferred high-slack waiting prefills do not disarm K-step decode.
             if self._should_defer_waiting_admission():
@@ -878,7 +907,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting = create_request_queue(self.policy)
                 self.kv_holding_waiting = create_request_queue(self.policy)
         else:
-            # Upstream default path (StagePace disabled): preserve exact call order.
+            # Upstream default path (or Stage 0 where Talker K-step deferral does not apply).
             self._drop_talker_drafts_if_prefill_pending()
             if self._should_defer_waiting_admission():
                 original_wait_queues = self.waiting, self.kv_holding_waiting
@@ -893,7 +922,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
-            if sp_ctrl is not None:
+            if sp_ctrl is not None and int(getattr(self, "_stagepace_stage_id", 0) or 0) > 0:
                 self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
         finally:
@@ -906,7 +935,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._restore_omni_wait_queues()
 
         if sp_ctrl is not None and scheduler_output.total_num_scheduled_tokens > 0:
-            if scheduler_output.scheduled_spec_decode_tokens:
+            if int(getattr(self, "_stagepace_stage_id", 0) or 0) == 0:
+                has_cache = bool(
+                    getattr(getattr(self, "cache_config", None), "enable_prefix_caching", False)
+                    or getattr(self, "connector", None) is not None
+                )
+                if has_cache:
+                    for req_id in scheduler_output.num_scheduled_tokens:
+                        req_obj = self.requests.get(req_id)
+                        if req_obj is not None:
+                            for bh in getattr(req_obj, "block_hashes", None) or ():
+                                self._stagepace_seen_hashes.add(bytes(bh))
+                    if len(self._stagepace_seen_hashes) > 16384:
+                        self._stagepace_seen_hashes.clear()
+            elif scheduler_output.scheduled_spec_decode_tokens:
                 sp_ctrl.talker_kstep_steps += 1
             else:
                 sp_ctrl.talker_single_frame_steps += 1

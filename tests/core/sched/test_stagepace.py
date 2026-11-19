@@ -250,3 +250,68 @@ def test_stage2_code2wav_dual_slack_wait_and_selective_express() -> None:
         now_mono=now_mono,
     )
     assert wait_low == 0.0 and reason_low == "continuation_guard"
+
+
+def test_stage0_and_stage1_work_aware_waiting_queue_reorder() -> None:
+    cfg = StagePaceConfig(enabled=True, enable_work_aware_reorder=True, enable_text_fastlane=True)
+    ctrl = SlackBatchController(cfg)
+    now = 3000.0
+    shared_hashes = [f"h-{i}".encode() for i in range(100)]  # 1600 cached tokens
+    seen = set(shared_hashes)
+
+    # Cold 5200-token Audio arrived first, followed by hot 1624-token Audio (1600 cached -> 24 rem)
+    # and hot 1624-token Text-only (1600 cached -> 24 * 0.30 = 7.2 effective rem)
+    r_cold = SimpleNamespace(
+        request_id="cold-5k",
+        prompt_token_ids=[1] * 5200,
+        num_computed_tokens=0,
+        block_hashes=[b"cold-0", b"cold-1"],
+        arrival_time=now - 0.02,
+        is_text=False,
+    )
+    r_hot_audio = SimpleNamespace(
+        request_id="hot-audio",
+        prompt_token_ids=[1] * 1624,
+        num_computed_tokens=0,
+        block_hashes=shared_hashes + [b"tail-a"],
+        arrival_time=now - 0.01,
+        is_text=False,
+    )
+    r_hot_text = SimpleNamespace(
+        request_id="hot-text",
+        prompt_token_ids=[1] * 1624,
+        num_computed_tokens=0,
+        block_hashes=shared_hashes + [b"tail-t"],
+        arrival_time=now,
+        is_text=True,
+    )
+
+    ordered = ctrl.order_waiting_requests(
+        [r_cold, r_hot_audio, r_hot_text],
+        stage_id=0,
+        seen_hashes=seen,
+        block_size=16,
+        is_stage_zero_final_fn=lambda r: r.is_text,
+        now_wall=now,
+    )
+    assert [r.request_id for r in ordered] == ["hot-text", "hot-audio", "cold-5k"]
+    assert ctrl.waiting_reorders == 1
+
+    # Anti-starvation aging: if cold-5k has waited 2.0 seconds (6400 token credit), it jumps to front!
+    r_cold_aged = SimpleNamespace(
+        request_id="cold-aged",
+        prompt_token_ids=[1] * 5200,
+        num_computed_tokens=0,
+        block_hashes=[b"cold-0"],
+        arrival_time=now - 2.0,
+        is_text=False,
+    )
+    ordered_aged = ctrl.order_waiting_requests(
+        [r_hot_audio, r_cold_aged],
+        stage_id=0,
+        seen_hashes=seen,
+        block_size=16,
+        is_stage_zero_final_fn=lambda r: r.is_text,
+        now_wall=now,
+    )
+    assert [r.request_id for r in ordered_aged] == ["cold-aged", "hot-audio"]

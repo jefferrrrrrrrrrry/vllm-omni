@@ -48,27 +48,26 @@ PACE_MODES = ("f0_baseline", "f1_static", "stagepace_m1", "stagepace_full")
 
 def build_stagepace_dict(args) -> dict:
     mode = args.pace_mode
-    token_cap = args.talker_kv_token_cap
-    if token_cap <= 0 and args.talker_kv_mib > 0:
-        # Exact physical capacity of Qwen3-Omni Talker KV pool: 20.0 KiB/token (13,088 tokens per 256 MiB)
-        token_cap = max(2048, int((args.talker_kv_mib * 1024) / 20))
     if mode == "f0_baseline":
         return {"enabled": False}
     if mode == "f1_static":
+        # Naive global admission limit without Text-only fast-lane or work-aware ordering
         return {
             "enabled": True,
             "enable_backpressure": True,
             "enable_text_fastlane": False,
             "enable_edf_queue": False,
-            "talker_max_inflight_reqs": args.talker_max_inflight,
+            "talker_max_inflight_reqs": min(5, args.talker_max_inflight),
             "talker_kv_high_watermark": args.talker_kv_high_wm,
             "talker_kv_low_watermark": args.talker_kv_low_wm,
-            "talker_kv_token_capacity": token_cap,
+            "talker_kv_token_capacity": 0,
             "default_ttfa_slo_ms": args.ttfa_slo_ms,
+            "enable_work_aware_reorder": False,
             "enable_talker_slack_coalesce": False,
             "enable_code2wav_dual_slack": False,
         }
     if mode == "stagepace_m1":
+        # Mechanism 1: Real-time Talker KV watermark + pipelined admission cap + Text-only fast-lane + EDF
         return {
             "enabled": True,
             "enable_backpressure": True,
@@ -77,8 +76,9 @@ def build_stagepace_dict(args) -> dict:
             "talker_max_inflight_reqs": args.talker_max_inflight,
             "talker_kv_high_watermark": args.talker_kv_high_wm,
             "talker_kv_low_watermark": args.talker_kv_low_wm,
-            "talker_kv_token_capacity": token_cap,
+            "talker_kv_token_capacity": args.talker_kv_token_cap,
             "default_ttfa_slo_ms": args.ttfa_slo_ms,
+            "enable_work_aware_reorder": False,
             "enable_talker_slack_coalesce": False,
             "enable_code2wav_dual_slack": False,
         }
@@ -90,8 +90,9 @@ def build_stagepace_dict(args) -> dict:
         "talker_max_inflight_reqs": args.talker_max_inflight,
         "talker_kv_high_watermark": args.talker_kv_high_wm,
         "talker_kv_low_watermark": args.talker_kv_low_wm,
-        "talker_kv_token_capacity": token_cap,
+        "talker_kv_token_capacity": args.talker_kv_token_cap,
         "default_ttfa_slo_ms": args.ttfa_slo_ms,
+        "enable_work_aware_reorder": True,
         "enable_talker_slack_coalesce": True,
         "talker_min_batch": 2,
         "talker_min_running": 1,
@@ -466,9 +467,9 @@ def main() -> None:
     parser.add_argument("--talker-kv-mib", type=int, default=256)
     parser.add_argument("--max-store-mib", type=int, default=512)
     parser.add_argument("--host-hs-mib", type=int, default=256)
-    parser.add_argument("--talker-max-inflight", type=int, default=6)
-    parser.add_argument("--talker-kv-high-wm", type=float, default=0.78)
-    parser.add_argument("--talker-kv-low-wm", type=float, default=0.62)
+    parser.add_argument("--talker-max-inflight", type=int, default=9)
+    parser.add_argument("--talker-kv-high-wm", type=float, default=0.85)
+    parser.add_argument("--talker-kv-low-wm", type=float, default=0.70)
     parser.add_argument("--talker-kv-token-cap", type=int, default=0)
     parser.add_argument("--ttfa-slo-ms", type=float, default=750.0)
     parser.add_argument("--cold-ttfa-slo-ms", type=float, default=1200.0)
