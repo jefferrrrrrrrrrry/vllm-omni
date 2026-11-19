@@ -44,6 +44,7 @@ class MooncakeConfig:
     min_write_hits: int = 1
     eviction_policy: str = "none"
     sync_write_truncation: bool = False
+    enable_directory_lookup_filter: bool = True
     max_store_bytes: int = 0
     host_hs_cache_bytes: int = 256 * 1024 * 1024
 
@@ -64,6 +65,7 @@ class MooncakeConfig:
             "enable_modality_decouple",
             "enable_cost_gate",
             "sync_write_truncation",
+            "enable_directory_lookup_filter",
         ):
             if not isinstance(getattr(self, flag), bool):
                 raise ValueError(f"mooncake_config.{flag} must be a boolean")

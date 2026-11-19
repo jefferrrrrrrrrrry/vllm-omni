@@ -694,7 +694,9 @@ async def run_spillover_suite(omni, args, report: dict) -> None:
     - Turn B (``local_turn``): immediate follow-up turn of the same session, testing
       L1 GPU HBM + HostHSCache reuse vs. #10107's L1 disablement.
     """
-    sessions = [f"spill-sess-{i}" for i in range(4)]
+    spill_len = int(getattr(args, "spill_len", 4096))
+    spill_sessions = int(getattr(args, "spill_sessions", 4))
+    sessions = [f"spill-{spill_len}-sess-{i}" for i in range(spill_sessions)]
     await fetch_worker_snapshot(omni, reset_chains=True, include_audit=False)
     all_results: list[dict] = []
     t_start = time.perf_counter()
@@ -708,7 +710,7 @@ async def run_spillover_suite(omni, args, report: dict) -> None:
             want_audio_a = is_warmup or ((rnd + s_idx) % 2 == 0)
             prompt_a = build_scaled_prompt(
                 sess_id,
-                4096,
+                spill_len,
                 turn_suffix=f"Round {rnd} Turn A: summarize item {(rnd * 4 + s_idx) % 8} concisely.",
             )
             res_a = await run_request(
@@ -729,7 +731,7 @@ async def run_spillover_suite(omni, args, report: dict) -> None:
             want_audio_b = (rnd == 0) or (not want_audio_a)
             prompt_b = build_scaled_prompt(
                 sess_id,
-                4096,
+                spill_len,
                 turn_suffix=f"Round {rnd} Turn B: state fact {(rnd * 4 + s_idx + 3) % 8} in one sentence.",
             )
             res_b = await run_request(
@@ -880,6 +882,8 @@ def main() -> None:
     parser.add_argument("--kv-mib", type=int, default=1280)
     parser.add_argument("--max-store-mib", type=int, default=384)
     parser.add_argument("--host-hs-mib", type=int, default=256)
+    parser.add_argument("--spill-len", type=int, default=4096)
+    parser.add_argument("--spill-sessions", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     asyncio.run(run_eval(args))

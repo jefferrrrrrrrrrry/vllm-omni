@@ -509,6 +509,33 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             if num_computed_tokens >= prompt_limit:
                 self._end_lookup(req_id)
                 return 0, False
+            # CoState v2 Fast-Path 1: Skip Mooncake RPC when UnifiedPrefixDirectory
+            # already knows L2 Store holds no blocks beyond the local L1 hit.
+            if self.settings.enable_directory_lookup_filter:
+                known_store = min(
+                    prompt_limit,
+                    self._costate_dir.contiguous_store_tokens(prompt_hashes, require_hs=not text_only),
+                )
+                if known_store <= num_computed_tokens:
+                    self._end_lookup(req_id)
+                    return 0, False
+                # CoState v2 Fast-Path 2: Pre-lookup OnlineCostGate check avoids even
+                # sending a Mooncake lookup RPC when recompute beats L2 restore.
+                if self.settings.enable_cost_gate and self._cost_gate is not None:
+                    host_hs_ok = self._costate_dir.host_hs_covers_prefix(prompt_hashes, num_computed_tokens)
+                    active_prefills = sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0)
+                    preview = self._cost_gate.preview_external_tokens(
+                        local_tokens=num_computed_tokens,
+                        candidate_total_tokens=known_store,
+                        is_text_only=text_only,
+                        host_hs_covers_local=host_hs_ok,
+                        enable_cost_gate=True,
+                        active_gpu_prefills=active_prefills,
+                    )
+                    if preview - (preview % self.block_size) <= num_computed_tokens:
+                        self._cost_gate.decisions_bypass_cost += 1
+                        self._end_lookup(req_id)
+                        return 0, False
         started = self._lookup_started.setdefault(req_id, time.monotonic())
         matched, load_async = super().get_num_new_matched_tokens(request, num_computed_tokens)
         if matched is not None:
@@ -636,6 +663,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 continue
             # Rotate only after native copies drain and recovery can run.
             self._scheduler_attempts.pop(req_id, None)
+        for req_id in connector_output.finished_sending or ():
+            if self._cost_gate is not None:
+                self._cost_gate.release_save(req_id)
         if getattr(self.settings, "enable_costate", False) and self._costate_dir is not None and self._cost_gate is not None:
             wmeta = connector_output.kv_connector_worker_meta
             if isinstance(wmeta, CoStateWorkerMetadata):
@@ -678,6 +708,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             )
 
         # 2. Newly scheduled compute requests
+        wave_prefills = len(scheduler_output.scheduled_new_reqs)
         for new_req in scheduler_output.scheduled_new_reqs:
             rid = new_req.req_id
             req_tuple = self.connector_scheduler._unfinished_requests.get(rid)
@@ -691,17 +722,29 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             was_ext = rid in self._ext_loaded_reqs
             self._ext_loaded_reqs.discard(rid)
             local_kv_tok = 0 if was_ext else new_req.num_computed_tokens
-            avail_hs = self._cost_gate.available_hs_save_blocks()
-            save_kv, save_hs, evicts = self._costate_dir.plan_store_write_and_evictions(
-                block_hashes=phashes,
-                target_tokens=(plen // self.block_size) * self.block_size,
-                is_text_only=tonly,
-                avail_hs_blocks=avail_hs,
+            active_gpu_prefills = max(
+                wave_prefills,
+                sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0),
             )
+            allow_store_write = (
+                (not self.settings.enable_cost_gate)
+                or self._cost_gate.can_admit_store_write(active_gpu_prefills=active_gpu_prefills)
+            )
+            if allow_store_write:
+                avail_hs = self._cost_gate.available_hs_save_blocks()
+                save_kv, save_hs, evicts = self._costate_dir.plan_store_write_and_evictions(
+                    block_hashes=phashes,
+                    target_tokens=(plen // self.block_size) * self.block_size,
+                    is_text_only=tonly,
+                    avail_hs_blocks=avail_hs,
+                    computed_start_tokens=local_kv_tok,
+                )
+            else:
+                save_kv, save_hs, evicts = 0, 0, []
             self._pending_evict_hashes.extend(evicts)
             promote_tok = min(local_kv_tok, save_hs) if (local_kv_tok > 0 and save_hs > 0) else 0
-            if save_hs > 0:
-                self._cost_gate.reserve_save(rid, save_hs)
+            if save_hs > 0 or save_kv > 0:
+                self._cost_gate.reserve_save(rid, save_hs, save_kv)
             plan = CoStateReqPlan(
                 req_id=rid,
                 prompt_len=plen,
@@ -720,8 +763,6 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             if plan.save_host_hs:
                 done_tok = min(plen, new_req.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0))
                 self._costate_dir.record_shadow_host_hs(phashes[: done_tok // self.block_size])
-                if done_tok >= plen:
-                    self._cost_gate.release_save(rid)
 
         # 3. Cached / chunked-prefill / resumed requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -737,14 +778,24 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 was_ext = rid in self._ext_loaded_reqs
                 self._ext_loaded_reqs.discard(rid)
                 local_kv_tok = 0 if was_ext else ureq.num_computed_tokens
-                avail_hs = self._cost_gate.available_hs_save_blocks()
-                save_kv, save_hs, evicts = self._costate_dir.plan_store_write_and_evictions(
-                    block_hashes=phashes,
-                    target_tokens=(plen // self.block_size) * self.block_size,
-                    is_text_only=tonly,
-                    avail_hs_blocks=avail_hs,
+                allow_store_write = (
+                    (not self.settings.enable_cost_gate)
+                    or self._cost_gate.can_admit_store_write(active_gpu_prefills=wave_prefills)
                 )
+                if allow_store_write:
+                    avail_hs = self._cost_gate.available_hs_save_blocks()
+                    save_kv, save_hs, evicts = self._costate_dir.plan_store_write_and_evictions(
+                        block_hashes=phashes,
+                        target_tokens=(plen // self.block_size) * self.block_size,
+                        is_text_only=tonly,
+                        avail_hs_blocks=avail_hs,
+                        computed_start_tokens=local_kv_tok,
+                    )
+                else:
+                    save_kv, save_hs, evicts = 0, 0, []
                 self._pending_evict_hashes.extend(evicts)
+                if save_hs > 0 or save_kv > 0:
+                    self._cost_gate.reserve_save(rid, save_hs, save_kv)
                 plan = CoStateReqPlan(
                     req_id=rid,
                     prompt_len=plen,
@@ -766,8 +817,6 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     cur_comp = cached_reqs.num_computed_tokens[idx]
                     done_tok = min(plan.prompt_len, cur_comp + scheduler_output.num_scheduled_tokens.get(rid, 0))
                     self._costate_dir.record_shadow_host_hs(plan.block_hashes[: done_tok // self.block_size])
-                    if done_tok >= plan.prompt_len:
-                        self._cost_gate.release_save(rid)
 
         self.connector_scheduler.save_kv_limits = {
             rid: p.save_store_kv_tokens for rid, p in self._active_req_plans.items()
@@ -1345,9 +1394,51 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 return
         added: list[bytes] = []
         evicted: list[bytes] = []
-        while begin < end:
-            if attempt.host_stage_cursor + self.block_size > attempt.prompt_len:
-                break
+        # 1. Finish any carry-over partial block first
+        if attempt.host_partial is not None and begin < end:
+            if attempt.host_stage_cursor + self.block_size <= attempt.prompt_len:
+                count = min(end - begin, self.block_size - attempt.host_partial_rows)
+                for name, tensor in tensors.items():
+                    attempt.host_partial[name][attempt.host_partial_rows : attempt.host_partial_rows + count].copy_(
+                        tensor[begin - start_token : begin - start_token + count]
+                    )
+                attempt.host_partial_rows += count
+                begin += count
+                if attempt.host_partial_rows == self.block_size:
+                    blk_idx = attempt.host_stage_cursor // self.block_size
+                    if blk_idx < len(attempt.hashes):
+                        bh = bytes(attempt.hashes[blk_idx])
+                        ok, ev = self._host_hs_cache.put_block(bh, attempt.host_partial, take_ownership=True)
+                        if ok:
+                            added.append(bh)
+                        evicted.extend(ev)
+                    attempt.host_stage_cursor += self.block_size
+                    attempt.host_partial = None
+                    attempt.host_partial_rows = 0
+
+        # 2. Bulk-insert all complete aligned blocks as bounded contiguous slabs
+        # (eliminates per-block malloc/clone overhead and enables single-pass memcpy on read).
+        if attempt.host_partial is None and begin < end:
+            full_blocks_avail = (end - begin) // self.block_size
+            start_blk = attempt.host_stage_cursor // self.block_size
+            max_hash_blocks = max(0, len(attempt.hashes) - start_blk)
+            num_full = min(full_blocks_avail, max_hash_blocks)
+            if num_full > 0:
+                span_rows = num_full * self.block_size
+                rel_start = begin - start_token
+                sliced = {name: tensor[rel_start : rel_start + span_rows] for name, tensor in tensors.items()}
+                bulk_added, bulk_ev = self._host_hs_cache.put_contiguous_blocks(
+                    attempt.hashes[start_blk : start_blk + num_full],
+                    sliced,
+                    self.block_size,
+                )
+                added.extend(bulk_added)
+                evicted.extend(bulk_ev)
+                begin += span_rows
+                attempt.host_stage_cursor += span_rows
+
+        # 3. Stage any trailing partial block (< block_size) if another full block can still complete
+        if begin < end and attempt.host_stage_cursor + self.block_size <= attempt.prompt_len:
             if attempt.host_partial is None:
                 attempt.host_partial = {
                     name: torch.empty((self.block_size, tensor.shape[1]), dtype=tensor.dtype)
@@ -1359,18 +1450,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     tensor[begin - start_token : begin - start_token + count]
                 )
             attempt.host_partial_rows += count
-            begin += count
-            if attempt.host_partial_rows == self.block_size:
-                blk_idx = attempt.host_stage_cursor // self.block_size
-                if blk_idx < len(attempt.hashes):
-                    bh = bytes(attempt.hashes[blk_idx])
-                    ok, ev = self._host_hs_cache.put_block(bh, attempt.host_partial)
-                    if ok:
-                        added.append(bh)
-                    evicted.extend(ev)
-                attempt.host_stage_cursor += self.block_size
-                attempt.host_partial = None
-                attempt.host_partial_rows = 0
+
         if added or evicted:
             self._pending_worker_meta.host_hs_added.extend(added)
             self._pending_worker_meta.host_hs_evicted.extend(evicted)
@@ -1397,6 +1477,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             if self.settings.enable_costate and self.settings.enable_modality_decouple and attempt.is_text_only:
                 return tensors
 
+            merged: dict[str, torch.Tensor] | None = None
             if attempt.rows is None:
                 max_req_hs = (
                     max(self.settings.max_hs_bytes, 3 * prompt_len * self._row_bytes)
@@ -1404,8 +1485,33 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     else self.settings.max_hs_bytes
                 )
                 attempt.rows = RequestHS(prompt_len, self.block_size, max_req_hs)
-                # CoState Mechanism 1B: Supply 8% HS for local GPU KV hits
-                if self.settings.enable_costate and attempt.local_kv_tokens > 0 and attempt.ext_load_tokens == 0:
+                # CoState v2 Fast-Path: Single-pass coalesced assembly directly from
+                # HostHSCache contiguous slabs + fresh suffix (eliminates double torch.cat).
+                if (
+                    self.settings.enable_costate
+                    and attempt.local_kv_tokens > 0
+                    and attempt.ext_load_tokens == 0
+                    and start_token <= attempt.local_kv_tokens
+                    and self._host_hs_cache is not None
+                ):
+                    local_blocks = attempt.local_kv_tokens // self.block_size
+                    fast_merged = self._host_hs_cache.assemble_with_suffix(
+                        attempt.hashes[:local_blocks], start_token, tensors
+                    )
+                    if fast_merged is not None:
+                        merged = fast_merged
+                        fresh_rows = tensors["embedding"].shape[0]
+                        attempt.rows._layout = (tensors["embedding"].shape[1], tensors["embedding"].dtype)
+                        attempt.rows._next_token = start_token + fresh_rows
+                        attempt.rows._save_cursor = attempt.local_kv_tokens
+                        attempt.host_stage_cursor = attempt.local_kv_tokens
+                # Fallback if any block missed in HostHSCache -> restore from Store
+                if (
+                    merged is None
+                    and self.settings.enable_costate
+                    and attempt.local_kv_tokens > 0
+                    and attempt.ext_load_tokens == 0
+                ):
                     local_hs = self._restore_local_or_store_hs(attempt, attempt.local_kv_tokens)
                     attempt.rows.restore(local_hs)
                     attempt.host_stage_cursor = attempt.local_kv_tokens
@@ -1418,7 +1524,10 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             fresh_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
             if self._memory_used() + 3 * fresh_bytes > self.settings.max_hs_bytes:
                 attempt.rows.save_enabled = False
-            merged = attempt.rows.append(start_token, tensors)
+            if merged is None:
+                merged = attempt.rows.append(start_token, tensors)
+            elif attempt.rows.save_enabled:
+                attempt.rows._stage_blocks(start_token, tensors)
 
             if self.settings.enable_costate and attempt.save_host_hs:
                 self._stage_host_hs_blocks(attempt, start_token, tensors)

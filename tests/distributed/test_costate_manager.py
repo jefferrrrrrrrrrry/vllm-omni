@@ -200,28 +200,28 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         max_pending_transfers=8,
     )
 
-    # 1. At 2048 tokens (128 blocks), Audio external restore (KV+HS) is slower than MoE prefill -> bypass!
-    chosen_audio_2k = gate.select_external_tokens(
+    # 1. At 512 tokens (32 blocks), fixed prefill launch amortization beats tiny L2 read -> restore!
+    chosen_audio_512 = gate.select_external_tokens(
         local_tokens=0,
-        candidate_total_tokens=2048,
+        candidate_total_tokens=512,
         is_text_only=False,
         host_hs_covers_local=False,
         enable_cost_gate=True,
     )
-    assert chosen_audio_2k == 0
+    assert chosen_audio_512 == 512
 
-    # 2. At 2048 tokens, Text-only external restore (KV only, 0 HS cost) IS faster than MoE prefill -> restore!
-    chosen_text_2k = gate.select_external_tokens(
+    # 2. At 4096 tokens (256 blocks), 3B-active MoE GPU prefill beats TCP L2 restore -> bypass (zero 4K inversion)!
+    chosen_audio_4k = gate.select_external_tokens(
         local_tokens=0,
-        candidate_total_tokens=2048,
-        is_text_only=True,
-        host_hs_covers_local=True,
+        candidate_total_tokens=4096,
+        is_text_only=False,
+        host_hs_covers_local=False,
         enable_cost_gate=True,
     )
-    assert chosen_text_2k == 2048
+    assert chosen_audio_4k == 0
 
-    # 3. At 8192 tokens, idle link (c=1) Audio restore beats cold prefill -> restore;
-    #    second concurrent reader sees active_read_count == 1 -> bypasses to overlap GPU compute!
+    # 3. At 8192 tokens (512 blocks), quadratic Attention makes idle L2 (c=1) beat cold prefill -> restore;
+    #    second concurrent reader sees active_read_count == 1 -> bypasses to prevent TCP contention inversion!
     chosen_8k_first = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=8192,
@@ -240,6 +240,61 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         enable_cost_gate=True,
     )
     assert chosen_8k_second == 0
+
+    # 4. Single-flight non-interfering L2 write admission
+    assert gate.can_admit_store_write(active_gpu_prefills=1)
+    assert not gate.can_admit_store_write(active_gpu_prefills=3)
+    gate.reserve_save("req-save", hs_tokens=0, kv_tokens=1024)
+    assert not gate.can_admit_store_write(active_gpu_prefills=1)
+    gate.release_save("req-save")
+    assert gate.can_admit_store_write(active_gpu_prefills=1)
+
+
+def test_host_hs_cache_contiguous_slabs_and_single_pass_suffix() -> None:
+    cache = HostHSCache(max_bytes=16 * 1024 * 1024)
+    keys = _hashes("slab", 10)
+    slab = {
+        "embedding": torch.arange(160 * 32, dtype=torch.bfloat16).reshape(160, 32),
+        "hidden": torch.arange(160 * 32, dtype=torch.bfloat16).reshape(160, 32) + 1.0,
+    }
+    added, evicted = cache.put_contiguous_blocks(keys, slab, block_size=16, max_slab_blocks=4)
+    assert len(added) == 10 and evicted == []
+    suffix = {
+        "embedding": torch.full((5, 32), 77.0, dtype=torch.bfloat16),
+        "hidden": torch.full((5, 32), 88.0, dtype=torch.bfloat16),
+    }
+    merged = cache.assemble_with_suffix(keys, prefix_rows=155, suffix=suffix)
+    assert merged is not None
+    assert merged["embedding"].shape == (160, 32)
+    assert torch.equal(merged["embedding"][:155], slab["embedding"][:155])
+    assert torch.equal(merged["embedding"][155:], suffix["embedding"])
+    assert torch.equal(merged["hidden"][:155], slab["hidden"][:155])
+    assert torch.equal(merged["hidden"][155:], suffix["hidden"])
+
+
+def test_directory_store_tokens_and_l1_skip_guard() -> None:
+    cfg = _make_cfg(min_write_hits=2)
+    directory = UnifiedPrefixDirectory(
+        block_size=16,
+        kv_block_bytes=1000,
+        hs_block_bytes=100,
+        settings=cfg,
+    )
+    chain = _hashes("l1skip", 4)
+    directory.record_request_visit("r1", chain, is_text_only=False)
+    directory.record_request_visit("r2", chain, is_text_only=False)
+    # If L1 hit skipped computing [0, 64), directory must NOT falsely mark them Store-resident
+    skv, shs, _ = directory.plan_store_write_and_evictions(
+        block_hashes=chain, target_tokens=64, is_text_only=False, avail_hs_blocks=100, computed_start_tokens=64
+    )
+    assert (skv, shs) == (0, 0)
+    assert directory.contiguous_store_tokens(chain, require_hs=True) == 0
+    # Once evicted from L1 and recomputed from token 0, Store write succeeds and directory records it
+    skv2, shs2, _ = directory.plan_store_write_and_evictions(
+        block_hashes=chain, target_tokens=64, is_text_only=False, avail_hs_blocks=100, computed_start_tokens=0
+    )
+    assert (skv2, shs2) == (64, 64)
+    assert directory.contiguous_store_tokens(chain, require_hs=True) == 64
 
 
 def test_worker_metadata_aggregation() -> None:

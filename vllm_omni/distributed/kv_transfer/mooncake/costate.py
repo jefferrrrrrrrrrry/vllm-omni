@@ -125,7 +125,7 @@ class HostHSCache:
     def __init__(self, max_bytes: int) -> None:
         self.max_bytes = max(0, int(max_bytes))
         self._lock = threading.RLock()
-        self._entries: OrderedDict[bytes, tuple[CaptureTensors, int]] = OrderedDict()
+        self._entries: OrderedDict[bytes, tuple[CaptureTensors, int, int, int]] = OrderedDict()
         self._used_bytes = 0
         self.hits = 0
         self.misses = 0
@@ -144,28 +144,87 @@ class HostHSCache:
         with self._lock:
             return block_hash in self._entries
 
-    def put_block(self, block_hash: bytes, tensors: CaptureTensors) -> tuple[bool, list[bytes]]:
+    def put_block(
+        self, block_hash: bytes, tensors: CaptureTensors, *, take_ownership: bool = False
+    ) -> tuple[bool, list[bytes]]:
         """Insert or refresh one block; return ``(stored, evicted_hashes)``."""
         key = bytes(block_hash)
-        cloned: CaptureTensors = {
-            name: tensor.detach().cpu().contiguous().clone() for name, tensor in tensors.items()
-        }
-        nbytes = sum(t.numel() * t.element_size() for t in cloned.values())
+        if take_ownership:
+            stored: CaptureTensors = {
+                name: tensor.detach() if tensor.device.type == "cpu" and tensor.is_contiguous()
+                else tensor.detach().cpu().contiguous()
+                for name, tensor in tensors.items()
+            }
+        else:
+            stored = {
+                name: tensor.detach().cpu().contiguous().clone() for name, tensor in tensors.items()
+            }
+        rows = stored["embedding"].shape[0]
+        nbytes = sum(t.numel() * t.element_size() for t in stored.values())
         if nbytes <= 0 or nbytes > self.max_bytes:
             return False, []
         evicted: list[bytes] = []
         with self._lock:
             if key in self._entries:
-                _, old_bytes = self._entries.pop(key)
+                _, _, _, old_bytes = self._entries.pop(key)
                 self._used_bytes -= old_bytes
             while self._used_bytes + nbytes > self.max_bytes and self._entries:
-                ev_key, (_, ev_bytes) = self._entries.popitem(last=False)
+                ev_key, (_, _, _, ev_bytes) = self._entries.popitem(last=False)
                 self._used_bytes -= ev_bytes
                 self.evictions += 1
                 evicted.append(ev_key)
-            self._entries[key] = (cloned, nbytes)
+            self._entries[key] = (stored, 0, rows, nbytes)
             self._used_bytes += nbytes
         return True, evicted
+
+    def put_contiguous_blocks(
+        self,
+        block_hashes: Sequence[bytes],
+        tensors: CaptureTensors,
+        block_size: int,
+        *,
+        max_slab_blocks: int = 64,
+    ) -> tuple[list[bytes], list[bytes]]:
+        """Insert aligned multi-block CPU tensors in bounded contiguous slabs.
+
+        Keeping up to ``max_slab_blocks`` (e.g. 64 blocks = ~8 MiB) in one
+        contiguous slab eliminates per-block malloc/clone overhead on write AND
+        allows ``assemble_with_suffix`` to coalesce 500+ block reads into a
+        handful of contiguous DDR5 memcpy calls (< 2 ms for 8K tokens).
+        """
+        num_blocks = len(block_hashes)
+        if num_blocks <= 0:
+            return [], []
+        added: list[bytes] = []
+        evicted: list[bytes] = []
+        for slab_start in range(0, num_blocks, max_slab_blocks):
+            slab_end = min(num_blocks, slab_start + max_slab_blocks)
+            row_start = slab_start * block_size
+            row_end = slab_end * block_size
+            slab: CaptureTensors = {
+                name: tensor[row_start:row_end].detach().cpu().contiguous().clone()
+                for name, tensor in tensors.items()
+            }
+            per_block_bytes = sum(
+                block_size * t.shape[1] * t.element_size() for t in slab.values()
+            )
+            if per_block_bytes <= 0 or per_block_bytes > self.max_bytes:
+                continue
+            with self._lock:
+                for local_idx in range(slab_end - slab_start):
+                    key = bytes(block_hashes[slab_start + local_idx])
+                    if key in self._entries:
+                        _, _, _, old_bytes = self._entries.pop(key)
+                        self._used_bytes -= old_bytes
+                    while self._used_bytes + per_block_bytes > self.max_bytes and self._entries:
+                        ev_key, (_, _, _, ev_bytes) = self._entries.popitem(last=False)
+                        self._used_bytes -= ev_bytes
+                        self.evictions += 1
+                        evicted.append(ev_key)
+                    self._entries[key] = (slab, local_idx * block_size, block_size, per_block_bytes)
+                    self._used_bytes += per_block_bytes
+                    added.append(key)
+        return added, evicted
 
     def get_block(self, block_hash: bytes) -> CaptureTensors | None:
         key = bytes(block_hash)
@@ -176,7 +235,27 @@ class HostHSCache:
                 return None
             self._entries.move_to_end(key)
             self.hits += 1
-            return entry[0]
+            slab, off, rows, _ = entry
+            return {name: t[off : off + rows] for name, t in slab.items()}
+
+    def _get_runs(self, block_hashes: Sequence[bytes]) -> list[tuple[CaptureTensors, int, int]] | None:
+        """Fetch block spans and coalesce adjacent views sharing the same slab."""
+        runs: list[tuple[CaptureTensors, int, int]] = []
+        with self._lock:
+            for raw_hash in block_hashes:
+                key = bytes(raw_hash)
+                entry = self._entries.get(key)
+                if entry is None:
+                    self.misses += 1
+                    return None
+                self._entries.move_to_end(key)
+                slab, off, rows, _ = entry
+                if runs and runs[-1][0] is slab and runs[-1][2] == off:
+                    runs[-1] = (slab, runs[-1][1], off + rows)
+                else:
+                    runs.append((slab, off, off + rows))
+            self.hits += len(block_hashes)
+        return runs
 
     def get_blocks(self, block_hashes: Sequence[bytes]) -> list[CaptureTensors] | None:
         out: list[CaptureTensors] = []
@@ -188,15 +267,60 @@ class HostHSCache:
                     self.misses += 1
                     return None
                 self._entries.move_to_end(key)
-                out.append(entry[0])
+                slab, off, rows, _ = entry
+                out.append({name: t[off : off + rows] for name, t in slab.items()})
             self.hits += len(out)
         return out
 
     def assemble_prefix(self, block_hashes: Sequence[bytes]) -> CaptureTensors | None:
-        blocks = self.get_blocks(block_hashes)
-        if not blocks:
+        runs = self._get_runs(block_hashes)
+        if not runs:
             return None
-        return {name: torch.cat([b[name] for b in blocks], dim=0) for name in ("embedding", "hidden")}
+        total_rows = sum(end - start for _, start, end in runs)
+        first_slab = runs[0][0]
+        out: CaptureTensors = {
+            name: torch.empty((total_rows, first_slab[name].shape[1]), dtype=first_slab[name].dtype)
+            for name in ("embedding", "hidden")
+        }
+        cursor = 0
+        for slab, start, end in runs:
+            span = end - start
+            for name in ("embedding", "hidden"):
+                out[name][cursor : cursor + span].copy_(slab[name][start:end])
+            cursor += span
+        return out
+
+    def assemble_with_suffix(
+        self,
+        block_hashes: Sequence[bytes],
+        prefix_rows: int,
+        suffix: CaptureTensors,
+    ) -> CaptureTensors | None:
+        """Single-pass coalesced assembly of ``[cached_prefix[:prefix_rows], suffix]``."""
+        if prefix_rows <= 0:
+            return dict(suffix)
+        runs = self._get_runs(block_hashes)
+        if not runs:
+            return None
+        suffix_rows = suffix["embedding"].shape[0]
+        total_rows = prefix_rows + suffix_rows
+        out: CaptureTensors = {
+            name: torch.empty((total_rows, suffix[name].shape[1]), dtype=suffix[name].dtype)
+            for name in ("embedding", "hidden")
+        }
+        cursor = 0
+        for slab, start, end in runs:
+            if cursor >= prefix_rows:
+                break
+            take = min(end - start, prefix_rows - cursor)
+            for name in ("embedding", "hidden"):
+                out[name][cursor : cursor + take].copy_(slab[name][start : start + take])
+            cursor += take
+        if cursor < prefix_rows:
+            return None
+        for name in ("embedding", "hidden"):
+            out[name][prefix_rows:total_rows].copy_(suffix[name])
+        return out
 
 
 @dataclass
@@ -221,12 +345,16 @@ class PrefixNode:
 
 
 def marginal_prefill_ms_per_block(depth: int) -> float:
-    """Calibrated per-16-token-block prefill cost on Qwen3-Omni-30B-A3B."""
+    """Calibrated per-16-token-block prefill cost on Qwen3-Omni-30B-A3B (RTX PRO 6000)."""
+    if depth < 32:
+        return 0.45
     if depth < 128:
-        return 0.38
+        return 0.55
     if depth < 256:
-        return 0.83
-    return 1.15
+        return 0.78
+    if depth < 512:
+        return 1.05
+    return 1.35
 
 
 class OnlineCostGate:
@@ -246,17 +374,21 @@ class OnlineCostGate:
         self.max_hs_bytes = max_hs_bytes
         self.max_pending_transfers = max_pending_transfers
         self.header_allowance = header_allowance
-        # Initialized from Wave 1A calibration; adapts via online EMA.
-        self.ema_kv_ms_per_block = 0.26
-        self.ema_hs_ms_per_block = 0.66
+        # Calibrated from real-GPU RTX PRO 6000 Qwen3-Omni-30B-A3B profiling:
+        # 92.3% KV dominates external L2 transfer (~0.72 ms/blk), while 7.7% HS
+        # (~0.14 ms/blk) overlaps in parallel on _read_executor.
+        self.ema_kv_ms_per_block = 0.72
+        self.ema_hs_ms_per_block = 0.14
         self.base_prefill_launch_ms = 42.0
-        self.base_restore_rpc_ms = 12.0
+        self.base_restore_rpc_ms = 18.0
+        self.restore_safety_margin = 1.08
 
         self._active_reads: dict[str, int] = {}
         self._active_saves: dict[str, int] = {}
         self.decisions_restore = 0
         self.decisions_bypass_cost = 0
         self.decisions_truncated_budget = 0
+        self.decisions_write_deferred = 0
 
     @property
     def shadow_hs_bytes(self) -> int:
@@ -286,9 +418,11 @@ class OnlineCostGate:
     def release_read(self, req_id: str) -> None:
         self._active_reads.pop(req_id, None)
 
-    def reserve_save(self, req_id: str, hs_tokens: int) -> None:
+    def reserve_save(self, req_id: str, hs_tokens: int, kv_tokens: int = 0) -> None:
         if hs_tokens > 0:
             self._active_saves[req_id] = 3 * hs_tokens * self.row_bytes + self.header_allowance
+        elif kv_tokens > 0:
+            self._active_saves[req_id] = 0
 
     def release_save(self, req_id: str) -> None:
         self._active_saves.pop(req_id, None)
@@ -321,9 +455,23 @@ class OnlineCostGate:
         q_saves = self.active_save_count
         kv_part = ext_kv_blocks * self.ema_kv_ms_per_block * (1.0 + 0.65 * q_reads + 0.25 * q_saves)
         hs_part = ext_hs_blocks * self.ema_hs_ms_per_block * (1.0 + 0.65 * q_reads + 0.30 * q_saves)
-        return self.base_restore_rpc_ms + kv_part + hs_part
+        # KV and HS restore in parallel; add 15% overlap contention factor.
+        return self.base_restore_rpc_ms + max(kv_part, hs_part) + 0.15 * min(kv_part, hs_part)
 
-    def select_external_tokens(
+    def can_admit_store_write(self, *, active_gpu_prefills: int = 0) -> bool:
+        """Single-flight, non-interfering L2 Store write admission.
+
+        Mooncake KV saves pin GPU KV blocks on a single send thread for 300-1100 ms.
+        Limiting L2 Store uploads to single-flight (``active_save_count == 0``)
+        and skipping uploads during heavy concurrent prefill waves prevents GPU KV
+        starvation while Tier-2 HostHSCache (CPU RAM) remains unconditionally warm.
+        """
+        if self.active_save_count > 0 or active_gpu_prefills >= 2:
+            self.decisions_write_deferred += 1
+            return False
+        return True
+
+    def _evaluate_external_tokens(
         self,
         *,
         local_tokens: int,
@@ -332,14 +480,15 @@ class OnlineCostGate:
         host_hs_covers_local: bool,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
+        record_stats: bool = True,
     ) -> int:
-        """Return optimal total cached token target ``>= local_tokens``."""
         ext_tokens = candidate_total_tokens - local_tokens
         if ext_tokens <= 0:
             return local_tokens
 
         if self.active_read_count >= self.max_pending_transfers:
-            self.decisions_truncated_budget += 1
+            if record_stats:
+                self.decisions_truncated_budget += 1
             return local_tokens
 
         # 1. Shadow HS memory budget pre-check (eliminates late start_load_kv failure)
@@ -352,7 +501,8 @@ class OnlineCostGate:
             max_hs_fit_blocks = free_bytes // (3 * self.block_size * self.row_bytes)
             max_hs_fit_tokens = max_hs_fit_blocks * self.block_size
             if hs_tokens_needed > max_hs_fit_tokens:
-                self.decisions_truncated_budget += 1
+                if record_stats:
+                    self.decisions_truncated_budget += 1
                 if host_hs_covers_local:
                     target_total = local_tokens + max_hs_fit_tokens
                 else:
@@ -361,7 +511,8 @@ class OnlineCostGate:
                     return local_tokens
 
         if not enable_cost_gate:
-            self.decisions_restore += 1
+            if record_stats:
+                self.decisions_restore += 1
             return target_total
 
         # 2. Compare estimated external restore latency against MoE GPU prefill savings
@@ -376,12 +527,56 @@ class OnlineCostGate:
         saved_ms = self.estimate_prefill_saved_ms(local_tokens, target_total, active_gpu_prefills)
         restore_ms = self.estimate_restore_ms(ext_kv_blocks, ext_hs_blocks)
 
-        if restore_ms < saved_ms:
-            self.decisions_restore += 1
+        if restore_ms * self.restore_safety_margin < saved_ms:
+            if record_stats:
+                self.decisions_restore += 1
             return target_total
 
-        self.decisions_bypass_cost += 1
+        if record_stats:
+            self.decisions_bypass_cost += 1
         return local_tokens
+
+    def preview_external_tokens(
+        self,
+        *,
+        local_tokens: int,
+        candidate_total_tokens: int,
+        is_text_only: bool,
+        host_hs_covers_local: bool,
+        enable_cost_gate: bool,
+        active_gpu_prefills: int = 0,
+    ) -> int:
+        """Non-mutating pre-lookup gate used to skip pointless Mooncake RPCs."""
+        return self._evaluate_external_tokens(
+            local_tokens=local_tokens,
+            candidate_total_tokens=candidate_total_tokens,
+            is_text_only=is_text_only,
+            host_hs_covers_local=host_hs_covers_local,
+            enable_cost_gate=enable_cost_gate,
+            active_gpu_prefills=active_gpu_prefills,
+            record_stats=False,
+        )
+
+    def select_external_tokens(
+        self,
+        *,
+        local_tokens: int,
+        candidate_total_tokens: int,
+        is_text_only: bool,
+        host_hs_covers_local: bool,
+        enable_cost_gate: bool,
+        active_gpu_prefills: int = 0,
+    ) -> int:
+        """Return optimal total cached token target ``>= local_tokens``."""
+        return self._evaluate_external_tokens(
+            local_tokens=local_tokens,
+            candidate_total_tokens=candidate_total_tokens,
+            is_text_only=is_text_only,
+            host_hs_covers_local=host_hs_covers_local,
+            enable_cost_gate=enable_cost_gate,
+            active_gpu_prefills=active_gpu_prefills,
+            record_stats=True,
+        )
 
 
 class UnifiedPrefixDirectory:
@@ -523,6 +718,16 @@ class UnifiedPrefixDirectory:
             matched += self.block_size
         return matched
 
+    def contiguous_store_tokens(self, block_hashes: Sequence[bytes], *, require_hs: bool) -> int:
+        """Longest contiguous prefix currently known to reside in L2 Mooncake Store."""
+        matched = 0
+        for raw_hash in block_hashes:
+            node = self._nodes.get(bytes(raw_hash))
+            if node is None or not node.store_kv or (require_hs and not node.store_hs):
+                break
+            matched += self.block_size
+        return matched
+
     def host_hs_covers_prefix(self, block_hashes: Sequence[bytes], num_tokens: int) -> bool:
         blocks = num_tokens // self.block_size
         if blocks <= 0:
@@ -606,6 +811,7 @@ class UnifiedPrefixDirectory:
         target_tokens: int,
         is_text_only: bool,
         avail_hs_blocks: int,
+        computed_start_tokens: int = 0,
     ) -> tuple[int, int, list[bytes]]:
         """Decide ``(save_kv_tokens, save_hs_tokens, evict_hashes)`` for Store."""
         num_blocks = min(len(block_hashes), target_tokens // self.block_size)
@@ -626,6 +832,17 @@ class UnifiedPrefixDirectory:
 
         chain = self._get_or_create_chain(block_hashes[:eligible_blocks])
         want_hs = not (is_text_only and self.settings.enable_modality_decouple)
+
+        # Prefix blocks skipped via L1 GPU hit are not recomputed by the Worker,
+        # so they cannot be materialized into L2 Store on this request. Never
+        # falsely mark skipped L1 blocks as Store-resident or write orphaned tails.
+        skip_blocks = min(len(chain), max(0, computed_start_tokens // self.block_size))
+        for idx in range(skip_blocks):
+            node = chain[idx]
+            if not node.store_kv or (want_hs and not node.store_hs):
+                return 0, 0, []
+        if skip_blocks >= len(chain):
+            return 0, 0, []
 
         # 2. Mechanism 3C: Synchronous (KV, HS) write truncation when HS staging is bounded
         if want_hs and self.settings.sync_write_truncation:
