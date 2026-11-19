@@ -27,6 +27,12 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.stagepace import (
+    SlackBatchController,
+    StagePaceConfig,
+    StagePaceReqMeta,
+    extract_and_pop_stagepace_meta,
+)
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -236,6 +242,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
+        sp_cfg = getattr(self, "_stagepace_cfg", None)
+        if sp_cfg is not None and sp_cfg.enabled:
+            meta = extract_and_pop_stagepace_meta(request, default_slo_ms=sp_cfg.default_ttfa_slo_ms)
+            if meta is not None:
+                self._stagepace_req_meta[request.request_id] = meta
         super().add_request(request)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
@@ -336,6 +347,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
+        sp_meta = getattr(self, "_stagepace_req_meta", None)
+        sp_ready = getattr(self, "_stagepace_ready_ts", None)
+        if sp_meta is not None or sp_ready is not None:
+            for req in finished:
+                if sp_meta is not None:
+                    sp_meta.pop(req.request_id, None)
+                if sp_ready is not None:
+                    sp_ready.pop(req.request_id, None)
+            for rid in cleanup_ids:
+                if sp_meta is not None:
+                    sp_meta.pop(rid, None)
+                if sp_ready is not None:
+                    sp_ready.pop(rid, None)
         return finished
 
     def _get_kv_transfer_criteria(self) -> dict | None:
@@ -416,8 +440,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._prefill_admission_max_wait_s * 1000,
                 self._prefill_admission_min_running,
             )
+        self._stagepace_cfg = StagePaceConfig.from_vllm_config(self.vllm_config)
+        self._stagepace_req_meta: dict[str, StagePaceReqMeta] = {}
+        self._stagepace_ready_ts: dict[str, float] = {}
+        stage_id = int(getattr(self.vllm_config.model_config, "stage_id", 0) or 0)
+        self._stagepace_ctrl: SlackBatchController | None = (
+            SlackBatchController(self._stagepace_cfg)
+            if (self._stagepace_cfg.enabled and self._stagepace_cfg.enable_talker_slack_coalesce and stage_id > 0)
+            else None
+        )
+        if self._stagepace_ctrl is not None:
+            logger.info(
+                "StagePace Stage-%d Talker slack coalescing enabled: target=%d, max_wait=%.1f ms, min_slack=%.1f ms",
+                stage_id,
+                self._stagepace_cfg.talker_min_batch,
+                self._stagepace_cfg.talker_max_wait_ms,
+                self._stagepace_cfg.talker_min_defer_slack_ms,
+            )
 
     def _should_defer_waiting_admission(self) -> bool:
+        ctrl = getattr(self, "_stagepace_ctrl", None)
+        if ctrl is not None:
+            waiting_list = list(self.waiting)
+            if not waiting_list:
+                return False
+            defer, _ = ctrl.should_defer_talker_prefill(
+                waiting_list,
+                running_count=len(self.running),
+                ready_ts_map=self._stagepace_ready_ts,
+                meta_map=self._stagepace_req_meta,
+            )
+            return defer
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
         if (
             min_batch <= 1
@@ -802,13 +855,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        # Talker K-frame guard: a step whose decode spans would be uneven
-        # (mixed prefill+decode rows, or a first-step decode joining a
-        # steady-state K-step request) must not carry the K-step drafts --
-        # the multi-frame loop requires uniform decode spans and the runner
-        # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
-
+        # Evaluate waiting-admission deferral BEFORE the Talker K-frame draft
+        # guard so deferred high-slack waiting prefills do not needlessly disarm
+        # active K-step multi-frame decode on Stage 1.
         original_wait_queues = None
         if self._should_defer_waiting_admission():
             original_wait_queues = self.waiting, self.kv_holding_waiting
@@ -823,6 +872,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
+            # Talker K-frame guard: a step whose decode spans would be uneven
+            # (mixed prefill+decode rows, or a first-step decode joining a
+            # steady-state K-step request) must not carry the K-step drafts --
+            # the multi-frame loop requires uniform decode spans and the runner
+            # refuses the rest.
+            self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
@@ -832,6 +887,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
+
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
+        if sp_ctrl is not None and scheduler_output.total_num_scheduled_tokens > 0:
+            if scheduler_output.scheduled_spec_decode_tokens:
+                sp_ctrl.talker_kstep_steps += 1
+            else:
+                sp_ctrl.talker_single_frame_steps += 1
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the

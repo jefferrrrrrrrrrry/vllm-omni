@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import heapq
 import os
 import shutil
 import threading
@@ -42,6 +43,12 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.sched.stagepace import (
+    STAGEPACE_INFO_KEY,
+    StagePaceConfig,
+    StagePaceReqMeta,
+    TalkerCapacityGuard,
+)
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
@@ -487,6 +494,72 @@ class OrchestratorBase:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+        # StagePace Mechanism 1: cross-stage Talker capacity guard & pacing queue (opt-in)
+        self._stagepace_cfg = self._resolve_stagepace_config(stage_pools)
+        self._stagepace_guard: TalkerCapacityGuard | None = (
+            TalkerCapacityGuard(self._stagepace_cfg)
+            if (self._stagepace_cfg.enabled and self._stagepace_cfg.enable_backpressure)
+            else None
+        )
+        self._stagepace_pending_heap: list[tuple[float, int, StageSubmissionMessage, int, float, float]] = []
+        self._stagepace_pending_ids: set[str] = set()
+        self._stagepace_seq: int = 0
+        self._stagepace_draining: bool = False
+        if self._stagepace_cfg.enabled:
+            logger.info(
+                "[Orchestrator] StagePace enabled: backpressure=%s text_fastlane=%s edf=%s "
+                "max_inflight=%d kv_wm=[%.2f, %.2f] default_ttfa_slo=%.0f ms",
+                self._stagepace_cfg.enable_backpressure,
+                self._stagepace_cfg.enable_text_fastlane,
+                self._stagepace_cfg.enable_edf_queue,
+                self._stagepace_cfg.talker_max_inflight_reqs,
+                self._stagepace_cfg.talker_kv_low_watermark,
+                self._stagepace_cfg.talker_kv_high_watermark,
+                self._stagepace_cfg.default_ttfa_slo_ms,
+            )
+
+    @staticmethod
+    def _resolve_stagepace_config(stage_pools: list[StagePool]) -> StagePaceConfig:
+        for pool in stage_pools:
+            vcfg = getattr(pool, "stage_vllm_config", None)
+            cfg = StagePaceConfig.from_vllm_config(vcfg)
+            if cfg.enabled:
+                return cfg
+        return StagePaceConfig()
+
+    def get_stagepace_diagnostics(self) -> dict[str, Any]:
+        if self._stagepace_guard is None:
+            return {"enabled": self._stagepace_cfg.enabled}
+        diag = self._stagepace_guard.snapshot_diagnostics()
+        diag["enabled"] = True
+        diag["pending_audio_queue"] = len(self._stagepace_pending_ids)
+        return diag
+
+    async def _drain_stagepace_queue(self) -> None:
+        guard = self._stagepace_guard
+        if guard is None or self._stagepace_draining or not self._stagepace_pending_heap:
+            return
+        self._stagepace_draining = True
+        try:
+            while self._stagepace_pending_heap:
+                _, _, msg, est_kv, enq_wall, _ = self._stagepace_pending_heap[0]
+                if msg.request_id not in self._stagepace_pending_ids:
+                    heapq.heappop(self._stagepace_pending_heap)
+                    continue
+                is_text_only = msg.final_stage_id <= msg.entry_stage_id
+                if not guard.should_admit_request(
+                    msg.request_id,
+                    is_text_only=is_text_only,
+                    est_kv_tokens=est_kv,
+                ):
+                    break
+                heapq.heappop(self._stagepace_pending_heap)
+                self._stagepace_pending_ids.discard(msg.request_id)
+                guard.record_throttle_wait((_time.time() - enq_wall) * 1000.0)
+                await self._handle_add_request(msg, _stagepace_admitted=True)
+        finally:
+            self._stagepace_draining = False
 
     def _init_metrics_state(
         self,
@@ -1199,6 +1272,21 @@ class OrchestratorBase:
                 replica_id,
                 int(_sched_stats.num_waiting_reqs),
             )
+
+        if self._stagepace_guard is not None and stage_id == 1:
+            changed = False
+            if _sched_stats is not None:
+                self._stagepace_guard.observe_talker_stats(
+                    kv_cache_usage=getattr(_sched_stats, "kv_cache_usage", None),
+                    num_running=getattr(_sched_stats, "num_running_reqs", None),
+                    num_waiting=getattr(_sched_stats, "num_waiting_reqs", None),
+                )
+                changed = True
+            for rid in raw_terminal_request_ids:
+                if self._stagepace_guard.release_lease(rid):
+                    changed = True
+            if changed and self._stagepace_pending_heap:
+                await self._drain_stagepace_queue()
 
         return processed
 
@@ -2112,6 +2200,14 @@ class OrchestratorBase:
                 req_state.running_counter_registered = False
         if self._shared_requests is not None:
             self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
+        if self._stagepace_guard is not None:
+            released_any = False
+            for rid in cleanup_ids:
+                self._stagepace_pending_ids.discard(rid)
+                if self._stagepace_guard.release_lease(rid):
+                    released_any = True
+            if released_any and self._stagepace_pending_heap:
+                await self._drain_stagepace_queue()
         return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
@@ -3597,6 +3693,23 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
+                if self._stagepace_cfg.enabled:
+                    add_info = base_input.get("additional_information")
+                    if not isinstance(add_info, dict):
+                        add_info = {}
+                        base_input["additional_information"] = add_info
+                    req_slo_ms = self._stagepace_cfg.default_ttfa_slo_ms
+                    raw_sp = add_info.get(STAGEPACE_INFO_KEY)
+                    if isinstance(raw_sp, dict) and raw_sp.get("ttfa_slo_ms") is not None:
+                        try:
+                            req_slo_ms = float(raw_sp["ttfa_slo_ms"])
+                        except (TypeError, ValueError):
+                            pass
+                    add_info[STAGEPACE_INFO_KEY] = StagePaceReqMeta(
+                        t_arr_wall=req_state.request_timestamp,
+                        ttfa_slo_ms=req_slo_ms,
+                        est_prompt_tokens=len(prompt_token_ids),
+                    ).to_dict()
                 downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
@@ -3974,7 +4087,9 @@ class Orchestrator(OrchestratorBase):
         params.extra_args = {**(params.extra_args or {}), PER_SAMPLE_KV_COUNT_KEY: n}
         return params
 
-    async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
+    async def _handle_add_request(
+        self, msg: StageSubmissionMessage, *, _stagepace_admitted: bool = False
+    ) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = msg.entry_stage_id
         request_id = msg.request_id
@@ -4062,6 +4177,42 @@ class Orchestrator(OrchestratorBase):
             final_stage_id,
             len(sampling_params_list),
         )
+
+        if self._stagepace_guard is not None:
+            is_text_only = final_stage_id <= stage_id
+            raw_ptoks = getattr(prompt, "prompt_token_ids", None)
+            est_prompt_len = len(raw_ptoks) if raw_ptoks is not None else 0
+            est_kv_tokens = 0 if is_text_only else (est_prompt_len + self._stagepace_cfg.talker_est_decode_tokens)
+            t_arr_wall = float(msg.request_timestamp or _time.time())
+            req_slo_ms = self._stagepace_cfg.default_ttfa_slo_ms
+            if isinstance(original_prompt, dict):
+                orig_ai = original_prompt.get("additional_information")
+                if isinstance(orig_ai, dict):
+                    sp_info = orig_ai.get(STAGEPACE_INFO_KEY)
+                    if isinstance(sp_info, dict) and sp_info.get("ttfa_slo_ms") is not None:
+                        try:
+                            req_slo_ms = float(sp_info["ttfa_slo_ms"])
+                        except (TypeError, ValueError):
+                            pass
+            if not _stagepace_admitted and not self._stagepace_guard.should_admit_request(
+                request_id,
+                is_text_only=is_text_only,
+                est_kv_tokens=est_kv_tokens,
+            ):
+                self._stagepace_guard.record_throttled(is_text_only=is_text_only)
+                self._stagepace_seq += 1
+                priority = (
+                    (t_arr_wall + req_slo_ms / 1000.0)
+                    if self._stagepace_cfg.enable_edf_queue
+                    else float(self._stagepace_seq)
+                )
+                heapq.heappush(
+                    self._stagepace_pending_heap,
+                    (priority, self._stagepace_seq, msg, est_kv_tokens, _time.time(), req_slo_ms),
+                )
+                self._stagepace_pending_ids.add(request_id)
+                return
+            self._stagepace_guard.acquire_lease(request_id, est_kv_tokens, is_text_only=is_text_only)
 
         req_state = OrchestratorRequestState(
             request_id=request_id,

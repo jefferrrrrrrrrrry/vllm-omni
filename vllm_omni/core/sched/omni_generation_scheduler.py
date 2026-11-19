@@ -26,6 +26,12 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.stagepace import (
+    SlackBatchController,
+    StagePaceConfig,
+    StagePaceReqMeta,
+    extract_and_pop_stagepace_meta,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniModelRunnerOutput
 
@@ -120,6 +126,45 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 "Generation scheduler decodes first chunks in express steps (min continuation slack %.2f s)",
                 self._express_min_slack_s,
             )
+        self._stagepace_cfg = StagePaceConfig.from_vllm_config(self.vllm_config)
+        self._stagepace_req_meta: dict[str, StagePaceReqMeta] = {}
+        self._stagepace_ctrl: SlackBatchController | None = (
+            SlackBatchController(self._stagepace_cfg)
+            if (self._stagepace_cfg.enabled and self._stagepace_cfg.enable_code2wav_dual_slack)
+            else None
+        )
+        if self._stagepace_ctrl is not None:
+            if self._express_min_slack_s <= 0.0 and self._stagepace_cfg.code2wav_continuation_guard_ms > 0.0:
+                self._express_min_slack_s = self._stagepace_cfg.code2wav_continuation_guard_ms / 1000.0
+            logger.info(
+                "StagePace Stage-2 Code2Wav dual-slack batching enabled: target=%d, max_wait=%.1f ms, "
+                "express_slack<=%.1f ms, cont_guard=%.1f ms",
+                self._stagepace_cfg.code2wav_target_batch,
+                self._stagepace_cfg.code2wav_max_wait_ms,
+                self._stagepace_cfg.code2wav_express_slack_threshold_ms,
+                self._stagepace_cfg.code2wav_continuation_guard_ms,
+            )
+
+    def add_request(self, request: Request) -> None:
+        sp_cfg = getattr(self, "_stagepace_cfg", None)
+        if sp_cfg is not None and sp_cfg.enabled:
+            meta = extract_and_pop_stagepace_meta(request, default_slo_ms=sp_cfg.default_ttfa_slo_ms)
+            if meta is not None:
+                self._stagepace_req_meta[request.request_id] = meta
+        super().add_request(request)
+
+    def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[Request]:
+        finished = super().finish_requests(request_ids, finished_status)
+        sp_meta = getattr(self, "_stagepace_req_meta", None)
+        if sp_meta is not None:
+            for req in finished:
+                sp_meta.pop(req.request_id, None)
+            if isinstance(request_ids, str):
+                sp_meta.pop(request_ids, None)
+            elif request_ids is not None:
+                for rid in request_ids:
+                    sp_meta.pop(rid, None)
+        return finished
 
     def _requires_atomic_chunk(self) -> bool:
         adapter = self.chunk_transfer_adapter
@@ -192,8 +237,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _drain_omni_connector_outputs(self):
         self._generation_defer_batch = False
         outputs = super()._drain_omni_connector_outputs()
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
         max_wait = getattr(self, "_generation_max_wait_s", 0)
         target = getattr(self, "_generation_min_batch_size", 1)
+        if sp_ctrl is not None and self._native_data_plane and self._retains_state_across_chunks:
+            target = max(target, min(self.max_num_running_reqs, self._stagepace_cfg.code2wav_target_batch))
+            max_wait = max(max_wait, self._stagepace_cfg.code2wav_max_wait_ms / 1000.0)
         coordinator = self.input_coordinator
         if not max_wait or target <= 1 or coordinator is None or self._pause_state != PauseState.UNPAUSED:
             return outputs
@@ -253,6 +302,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 waited_without_input = True
             elif len(runnable) >= target or len(self.requests) < target:
                 break
+            elif sp_ctrl is not None:
+                dyn_wait_s, _ = sp_ctrl.compute_code2wav_wait_s(
+                    list(runnable),
+                    requests_by_id=self.requests,
+                    chunk_started=self._chunk_started,
+                    meta_map=self._stagepace_req_meta,
+                    stream_audio=self._stream_audio,
+                )
+                if dyn_wait_s <= 0.0:
+                    break
+                deadline = min(deadline, time.monotonic() + dyn_wait_s)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -500,7 +560,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # An express step isolates first chunks from ready continuations.
         # Two express steps never run back to back; the optional slack guard
         # requires playback headroom before delaying a continuation.
-        first_chunk_express = getattr(self, "_first_chunk_express", False)
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
+        first_chunk_express = getattr(self, "_first_chunk_express", False) or (sp_ctrl is not None)
         express = (
             first_chunk_express
             and native_chunks
@@ -512,6 +573,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 for r in self.waiting
             )
         )
+        if express and sp_ctrl is not None:
+            urgent_express, _ = sp_ctrl.should_code2wav_express(
+                list(self.waiting),
+                chunk_started=self._chunk_started,
+                meta_map=self._stagepace_req_meta,
+            )
+            if not urgent_express:
+                express = False
         if express and getattr(self, "_express_min_slack_s", 0) > 0 and not self._continuations_have_slack():
             express = False
         if first_chunk_express:
@@ -764,6 +833,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Record request ids scheduled in this step for the next update.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+        if sp_ctrl is not None and num_scheduled_tokens:
+            sp_ctrl.code2wav_steps += 1
+            sp_ctrl.code2wav_total_batch_rows += len(num_scheduled_tokens)
 
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,
