@@ -495,7 +495,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
         if any(a is not b for a, b in zip(ordered, waiting_list)):
             self.waiting.remove_requests(ordered)
-            self.waiting.prepend_requests(ordered)
+            # FCFSRequestQueue.prepend_requests uses deque.extendleft, which reverses
+            # iteration order; pass reversed(ordered) so the queue head matches ordered[0].
+            self.waiting.prepend_requests(list(reversed(ordered)))
 
     def _should_defer_waiting_admission(self) -> bool:
         ctrl = getattr(self, "_stagepace_ctrl", None)

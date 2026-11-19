@@ -477,8 +477,10 @@ class SlackBatchController:
                 mod_weight = 0.30 if (is_text and cfg.enable_text_fastlane) else 1.0
                 arr_ts = float(getattr(req, "arrival_time", t_wall) or t_wall)
                 wait_s = max(0.0, t_wall - arr_ts)
-                # Anti-starvation aging: 3200 tokens/s aging credit guarantees bounded wait for cold prompts
-                score = float(rem_tokens) * mod_weight - 3200.0 * wait_s
+                # 50ms same-wave grace window so arrival jitter within a burst wave
+                # never inverts modality/work priority; 3200 tok/s aging after 50ms prevents starvation.
+                effective_wait_s = max(0.0, wait_s - 0.05)
+                score = float(rem_tokens) * mod_weight - 3200.0 * effective_wait_s
             else:
                 ready_ts = (
                     ready_ts_map.setdefault(rid, t_wall)
@@ -487,7 +489,8 @@ class SlackBatchController:
                 )
                 rem_tokens = max(1, prompt_len - computed)
                 wait_s = max(0.0, t_wall - ready_ts)
-                score = float(rem_tokens) - 3200.0 * wait_s
+                effective_wait_s = max(0.0, wait_s - 0.05)
+                score = float(rem_tokens) - 3200.0 * effective_wait_s
 
             scored.append((score, idx, req))
 
