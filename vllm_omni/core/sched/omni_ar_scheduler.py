@@ -490,7 +490,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stage_id=stage_id,
             seen_hashes=self._stagepace_seen_hashes,
             block_size=bsize,
-            is_stage_zero_final_fn=self._request_is_stage_zero_final if stage_id == 0 else None,
+            is_stage_zero_final_fn=self._request_omits_chunk_transfer_to_next_stage if stage_id == 0 else None,
             ready_ts_map=self._stagepace_ready_ts,
         )
         if any(a is not b for a, b in zip(ordered, waiting_list)):
