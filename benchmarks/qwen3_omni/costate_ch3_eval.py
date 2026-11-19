@@ -37,7 +37,7 @@ from tests.engine import kv_offload_helpers as helpers
 from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
 REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
-MODES = ("off", "pr10107", "pr10107_tuned", "topo_lru", "costate_ext", "costate")
+MODES = ("off", "local_only", "pr10107", "pr10107_tuned", "topo_lru", "costate_ext", "costate")
 
 
 class CoStateEvalWorker(GPUARWorker):
@@ -258,7 +258,7 @@ def deployment(
     host_hs_bytes: int,
     force_min_write_hits: int | None = None,
 ) -> dict:
-    enable_local = mode == "costate"
+    enable_local = mode in ("local_only", "costate")
     thinker: dict = {
         "use_v2_model_runner": True,
         "worker_cls": "benchmarks.qwen3_omni.costate_ch3_eval.CoStateEvalWorker",
@@ -273,7 +273,7 @@ def deployment(
         "kv_cache_memory_bytes": kv_bytes,
         "revision": REVISION,
     }
-    if mode != "off":
+    if mode not in ("off", "local_only"):
         assert store_config is not None, "Mooncake store_config required for cached modes"
         mc_cfg: dict[str, object] = {
             "config_file": str(Path(store_config).resolve()),
@@ -683,6 +683,101 @@ async def run_e2e_serving_suite(omni, args, report: dict) -> None:
     report["e2e_requests"] = all_results
 
 
+async def run_spillover_suite(omni, args, report: dict) -> None:
+    """Controlled L1-spillover + multi-turn burst benchmark (Working Set > GPU HBM).
+
+    4 long sessions (4096-token shared prefix each; ~1.54 GiB total KV > 1024 MiB
+    GPU KV cap, fitting inside 1024 MiB L2 Mooncake Store) rotate across 3 rounds.
+    In each round, each session runs 2 back-to-back turns:
+    - Turn A (``spill_turn``): arrives after 3 other 4K sessions evicted it from L1
+      GPU HBM, testing L2 spillover recovery vs. Local-Only's L1 miss.
+    - Turn B (``local_turn``): immediate follow-up turn of the same session, testing
+      L1 GPU HBM + HostHSCache reuse vs. #10107's L1 disablement.
+    """
+    sessions = [f"spill-sess-{i}" for i in range(4)]
+    await fetch_worker_snapshot(omni, reset_chains=True, include_audit=False)
+    all_results: list[dict] = []
+    t_start = time.perf_counter()
+
+    for rnd in range(4):
+        for s_idx, sess_id in enumerate(sessions):
+            # Round 0: 1st visit (L1 warmup); Round 1: 2nd visit after L1 eviction
+            # (promotes hot sessions into L2 Store under CoState 2-Hit admission).
+            # Rounds 2-3: steady-state measurement (Turn A = L2 spillover, Turn B = L1 hit).
+            is_warmup = rnd < 2
+            want_audio_a = is_warmup or ((rnd + s_idx) % 2 == 0)
+            prompt_a = build_scaled_prompt(
+                sess_id,
+                4096,
+                turn_suffix=f"Round {rnd} Turn A: summarize item {(rnd * 4 + s_idx) % 8} concisely.",
+            )
+            res_a = await run_request(
+                omni,
+                prompt_a,
+                f"spill-r{rnd}-s{s_idx}-A",
+                want_audio=want_audio_a,
+                max_tokens=24,
+                kind="warmup_turn" if is_warmup else "spill_turn",
+            )
+            res_a["round"] = rnd
+            res_a["session"] = sess_id
+            res_a["phase"] = "warmup" if is_warmup else "spill_turn"
+            all_results.append(res_a)
+            await asyncio.sleep(0.15)
+
+            # Turn B: immediate follow-up turn (should hit L1 GPU HBM + HostHSCache)
+            want_audio_b = (rnd == 0) or (not want_audio_a)
+            prompt_b = build_scaled_prompt(
+                sess_id,
+                4096,
+                turn_suffix=f"Round {rnd} Turn B: state fact {(rnd * 4 + s_idx + 3) % 8} in one sentence.",
+            )
+            res_b = await run_request(
+                omni,
+                prompt_b,
+                f"spill-r{rnd}-s{s_idx}-B",
+                want_audio=want_audio_b,
+                max_tokens=24,
+                kind="warmup_turn" if is_warmup else "local_turn",
+            )
+            res_b["round"] = rnd
+            res_b["session"] = sess_id
+            res_b["phase"] = "warmup" if is_warmup else "local_turn"
+            all_results.append(res_b)
+            await asyncio.sleep(0.15)
+            print(
+                f"[spillover|{args.mode}] r={rnd} s={s_idx} "
+                f"A({res_a['modality']},cached={res_a['cached_tokens']},TTFT={res_a['ttft_ms']:.1f}ms,TTFA={res_a['first_audio_ms'] or 0:.1f}ms) "
+                f"B({res_b['modality']},cached={res_b['cached_tokens']},TTFT={res_b['ttft_ms']:.1f}ms,TTFA={res_b['first_audio_ms'] or 0:.1f}ms)",
+                flush=True,
+            )
+
+    total_wall_s = time.perf_counter() - t_start
+    await asyncio.sleep(1.5)
+    final_snap = await fetch_worker_snapshot(omni, reset_chains=False, include_audit=True)
+
+    steady = [r for r in all_results if r["round"] >= 2]
+    spill = [r for r in steady if r["phase"] == "spill_turn"]
+    local = [r for r in steady if r["phase"] == "local_turn"]
+    report["spillover_summary"] = {
+        "total_wall_s": total_wall_s,
+        "steady_count": len(steady),
+        "steady_overall_ttft_ms": stats_dict([r["ttft_ms"] for r in steady if r["ttft_ms"] is not None]),
+        "steady_overall_ttfa_ms": stats_dict([r["first_audio_ms"] for r in steady if r["first_audio_ms"] is not None]),
+        "spill_turn_ttft_ms": stats_dict([r["ttft_ms"] for r in spill if r["ttft_ms"] is not None]),
+        "spill_turn_ttfa_ms": stats_dict([r["first_audio_ms"] for r in spill if r["first_audio_ms"] is not None]),
+        "spill_turn_cached_tokens": [r["cached_tokens"] for r in spill],
+        "local_turn_ttft_ms": stats_dict([r["ttft_ms"] for r in local if r["ttft_ms"] is not None]),
+        "local_turn_ttfa_ms": stats_dict([r["first_audio_ms"] for r in local if r["first_audio_ms"] is not None]),
+        "local_turn_cached_tokens": [r["cached_tokens"] for r in local],
+        "store_audit": final_snap.get("store_audit", {}),
+        "worker_diag": final_snap.get("diag", {}),
+    }
+    for r in all_results:
+        r.pop("token_ids", None)
+    report["spillover_requests"] = all_results
+
+
 async def run_eval(args) -> None:
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
@@ -760,6 +855,8 @@ async def run_eval(args) -> None:
             await run_read_matrix_suite(omni, args, report)
         elif args.suite == "e2e_serving":
             await run_e2e_serving_suite(omni, args, report)
+        elif args.suite == "spillover":
+            await run_spillover_suite(omni, args, report)
 
         report["completed"] = True
     finally:
@@ -769,7 +866,7 @@ async def run_eval(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("exactness", "read_matrix", "e2e_serving"), required=True)
+    parser.add_argument("--suite", choices=("exactness", "read_matrix", "e2e_serving", "spillover"), required=True)
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--model", default="/mnt/pfs/wangzhen/workspace/model/Qwen3-Omni-30B-A3B-Instruct")
     parser.add_argument("--store-config", default=os.environ.get("MOONCAKE_CONFIG_PATH"))
