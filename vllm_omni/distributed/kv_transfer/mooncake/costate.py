@@ -144,6 +144,16 @@ class HostHSCache:
         with self._lock:
             return block_hash in self._entries
 
+    def contiguous_tokens(self, block_hashes: Sequence[bytes], block_size: int) -> int:
+        """Longest contiguous prefix starting at block 0 present in HostHSCache."""
+        matched = 0
+        with self._lock:
+            for raw_hash in block_hashes:
+                if bytes(raw_hash) not in self._entries:
+                    break
+                matched += block_size
+        return matched
+
     def put_block(
         self, block_hash: bytes, tensors: CaptureTensors, *, take_ownership: bool = False
     ) -> tuple[bool, list[bytes]]:
@@ -374,11 +384,13 @@ class OnlineCostGate:
         self.max_hs_bytes = max_hs_bytes
         self.max_pending_transfers = max_pending_transfers
         self.header_allowance = header_allowance
-        # Calibrated from real-GPU RTX PRO 6000 Qwen3-Omni-30B-A3B profiling:
-        # 92.3% KV dominates external L2 transfer (~0.72 ms/blk), while 7.7% HS
-        # (~0.14 ms/blk) overlaps in parallel on _read_executor.
-        self.ema_kv_ms_per_block = 0.72
-        self.ema_hs_ms_per_block = 0.14
+        # Calibrated from Wave 1A + RTX PRO 6000 Qwen3-Omni-30B-A3B profiling:
+        # Pure L2 KV transfer is fast (~0.28 ms/blk), whereas L2 HS + safetensors
+        # per-block deserialization is the bottleneck (~0.66 ms/blk). When Cut #4
+        # supplies HS from HostHSCache (ext_hs_blocks=0), L2 KV-only restore beats
+        # MoE GPU recomputation even at 4K tokens!
+        self.ema_kv_ms_per_block = 0.28
+        self.ema_hs_ms_per_block = 0.66
         self.base_prefill_launch_ms = 42.0
         self.base_restore_rpc_ms = 18.0
         self.restore_safety_margin = 1.08
@@ -477,7 +489,8 @@ class OnlineCostGate:
         local_tokens: int,
         candidate_total_tokens: int,
         is_text_only: bool,
-        host_hs_covers_local: bool,
+        host_hs_covers_local: bool = False,
+        host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
         record_stats: bool = True,
@@ -491,22 +504,25 @@ class OnlineCostGate:
                 self.decisions_truncated_budget += 1
             return local_tokens
 
+        # Cross-tier HostHSCache coverage: hash-indexed HostHSCache survives GPU
+        # L1 KV eviction (3x+ larger effective working set than GPU HBM).
+        covered_host_hs = (
+            max(0, host_hs_tokens)
+            if host_hs_tokens is not None
+            else (local_tokens if host_hs_covers_local else 0)
+        )
+
         # 1. Shadow HS memory budget pre-check (eliminates late start_load_kv failure)
         target_total = candidate_total_tokens
         if not is_text_only:
-            hs_tokens_needed = (
-                (target_total - local_tokens) if host_hs_covers_local else target_total
-            )
+            hs_tokens_needed = max(0, target_total - covered_host_hs)
             free_bytes = max(0, self.max_hs_bytes - self.shadow_hs_bytes - self.header_allowance)
             max_hs_fit_blocks = free_bytes // (3 * self.block_size * self.row_bytes)
             max_hs_fit_tokens = max_hs_fit_blocks * self.block_size
             if hs_tokens_needed > max_hs_fit_tokens:
                 if record_stats:
                     self.decisions_truncated_budget += 1
-                if host_hs_covers_local:
-                    target_total = local_tokens + max_hs_fit_tokens
-                else:
-                    target_total = max_hs_fit_tokens
+                target_total = min(target_total, covered_host_hs + max_hs_fit_tokens)
                 if target_total <= local_tokens:
                     return local_tokens
 
@@ -519,10 +535,8 @@ class OnlineCostGate:
         ext_kv_blocks = (target_total - local_tokens) // self.block_size
         if is_text_only:
             ext_hs_blocks = 0
-        elif host_hs_covers_local:
-            ext_hs_blocks = ext_kv_blocks
         else:
-            ext_hs_blocks = target_total // self.block_size
+            ext_hs_blocks = max(0, (target_total - covered_host_hs) // self.block_size)
 
         saved_ms = self.estimate_prefill_saved_ms(local_tokens, target_total, active_gpu_prefills)
         restore_ms = self.estimate_restore_ms(ext_kv_blocks, ext_hs_blocks)
@@ -542,7 +556,8 @@ class OnlineCostGate:
         local_tokens: int,
         candidate_total_tokens: int,
         is_text_only: bool,
-        host_hs_covers_local: bool,
+        host_hs_covers_local: bool = False,
+        host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
     ) -> int:
@@ -552,6 +567,7 @@ class OnlineCostGate:
             candidate_total_tokens=candidate_total_tokens,
             is_text_only=is_text_only,
             host_hs_covers_local=host_hs_covers_local,
+            host_hs_tokens=host_hs_tokens,
             enable_cost_gate=enable_cost_gate,
             active_gpu_prefills=active_gpu_prefills,
             record_stats=False,
@@ -563,7 +579,8 @@ class OnlineCostGate:
         local_tokens: int,
         candidate_total_tokens: int,
         is_text_only: bool,
-        host_hs_covers_local: bool,
+        host_hs_covers_local: bool = False,
+        host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
     ) -> int:
@@ -573,6 +590,7 @@ class OnlineCostGate:
             candidate_total_tokens=candidate_total_tokens,
             is_text_only=is_text_only,
             host_hs_covers_local=host_hs_covers_local,
+            host_hs_tokens=host_hs_tokens,
             enable_cost_gate=enable_cost_gate,
             active_gpu_prefills=active_gpu_prefills,
             record_stats=True,
@@ -718,12 +736,29 @@ class UnifiedPrefixDirectory:
             matched += self.block_size
         return matched
 
-    def contiguous_store_tokens(self, block_hashes: Sequence[bytes], *, require_hs: bool) -> int:
-        """Longest contiguous prefix currently known to reside in L2 Mooncake Store."""
+    def contiguous_host_hs_tokens(self, block_hashes: Sequence[bytes]) -> int:
+        """Longest contiguous prefix whose HS is currently resident in HostHSCache."""
         matched = 0
         for raw_hash in block_hashes:
             node = self._nodes.get(bytes(raw_hash))
-            if node is None or not node.store_kv or (require_hs and not node.store_hs):
+            if node is None or not node.host_hs:
+                break
+            matched += self.block_size
+        return matched
+
+    def contiguous_store_tokens(
+        self, block_hashes: Sequence[bytes], *, require_hs: bool, host_hs_tokens: int = 0
+    ) -> int:
+        """Longest contiguous prefix currently known to reside in L2 Mooncake Store.
+
+        Blocks already covered by ``host_hs_tokens`` only need ``store_kv`` in L2
+        (cross-tier decoupled assembly: L2 KV + HostHSCache HS).
+        """
+        matched = 0
+        for raw_hash in block_hashes:
+            node = self._nodes.get(bytes(raw_hash))
+            need_store_hs = require_hs and (matched + self.block_size > host_hs_tokens)
+            if node is None or not node.store_kv or (need_store_hs and not node.store_hs):
                 break
             matched += self.block_size
         return matched

@@ -210,15 +210,26 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
     )
     assert chosen_audio_512 == 512
 
-    # 2. At 4096 tokens (256 blocks), 3B-active MoE GPU prefill beats TCP L2 restore -> bypass (zero 4K inversion)!
-    chosen_audio_4k = gate.select_external_tokens(
+    # 2. At 4096 tokens (256 blocks), Audio WITHOUT HostHSCache (must read/deserialize HS from L2)
+    #    is slower than 3B MoE prefill -> bypass; WITH HostHSCache (Cut #4: L2 pure-KV + RAM HS)
+    #    it skips L2 HS deserialization completely and beats MoE prefill by 2x -> restore!
+    chosen_audio_4k_cold_host = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=4096,
         is_text_only=False,
-        host_hs_covers_local=False,
+        host_hs_tokens=0,
         enable_cost_gate=True,
     )
-    assert chosen_audio_4k == 0
+    assert chosen_audio_4k_cold_host == 0
+
+    chosen_audio_4k_warm_host = gate.select_external_tokens(
+        local_tokens=0,
+        candidate_total_tokens=4096,
+        is_text_only=False,
+        host_hs_tokens=4096,
+        enable_cost_gate=True,
+    )
+    assert chosen_audio_4k_warm_host == 4096
 
     # 3. At 8192 tokens (512 blocks), quadratic Attention makes idle L2 (c=1) beat cold prefill -> restore;
     #    second concurrent reader sees active_read_count == 1 -> bypasses to prevent TCP contention inversion!
