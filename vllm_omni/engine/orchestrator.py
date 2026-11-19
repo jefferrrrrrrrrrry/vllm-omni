@@ -4102,7 +4102,7 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
         sampling_params_list = [_without_per_sample_kv_count(params) for params in sampling_params_list]
 
-        if msg.requested_replica_id is not None:
+        if msg.requested_replica_id is not None and not _stagepace_admitted:
             try:
                 self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
             except OmniClientError as exc:

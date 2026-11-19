@@ -47,6 +47,10 @@ PACE_MODES = ("f0_baseline", "f1_static", "stagepace_m1", "stagepace_full")
 
 def build_stagepace_dict(args) -> dict:
     mode = args.pace_mode
+    token_cap = args.talker_kv_token_cap
+    if token_cap <= 0 and args.talker_kv_mib > 0:
+        # ~22 KiB per token in Qwen3-Omni Talker KV pool -> proactive flight-time lease cap
+        token_cap = max(2048, int((args.talker_kv_mib * 1024) / 22))
     if mode == "f0_baseline":
         return {"enabled": False}
     if mode == "f1_static":
@@ -58,7 +62,7 @@ def build_stagepace_dict(args) -> dict:
             "talker_max_inflight_reqs": args.talker_max_inflight,
             "talker_kv_high_watermark": args.talker_kv_high_wm,
             "talker_kv_low_watermark": args.talker_kv_low_wm,
-            "talker_kv_token_capacity": args.talker_kv_token_cap,
+            "talker_kv_token_capacity": token_cap,
             "default_ttfa_slo_ms": args.ttfa_slo_ms,
             "enable_talker_slack_coalesce": False,
             "enable_code2wav_dual_slack": False,
@@ -72,7 +76,7 @@ def build_stagepace_dict(args) -> dict:
             "talker_max_inflight_reqs": args.talker_max_inflight,
             "talker_kv_high_watermark": args.talker_kv_high_wm,
             "talker_kv_low_watermark": args.talker_kv_low_wm,
-            "talker_kv_token_capacity": args.talker_kv_token_cap,
+            "talker_kv_token_capacity": token_cap,
             "default_ttfa_slo_ms": args.ttfa_slo_ms,
             "enable_talker_slack_coalesce": False,
             "enable_code2wav_dual_slack": False,
@@ -85,7 +89,7 @@ def build_stagepace_dict(args) -> dict:
         "talker_max_inflight_reqs": args.talker_max_inflight,
         "talker_kv_high_watermark": args.talker_kv_high_wm,
         "talker_kv_low_watermark": args.talker_kv_low_wm,
-        "talker_kv_token_capacity": args.talker_kv_token_cap,
+        "talker_kv_token_capacity": token_cap,
         "default_ttfa_slo_ms": args.ttfa_slo_ms,
         "enable_talker_slack_coalesce": True,
         "talker_min_batch": 2,
@@ -246,10 +250,6 @@ async def run_one_request(omni, entry: dict, *, ttfa_slo_ms: float) -> dict:
     modalities = ["text", "audio"] if want_audio else ["text"]
 
     prompt = dict(entry["item"])
-    add_info = dict(prompt.get("additional_information") or {})
-    add_info["stagepace"] = {"ttfa_slo_ms": ttfa_slo_ms}
-    prompt["additional_information"] = add_info
-
     start = time.perf_counter()
     res: dict = {
         "request_id": req_id,

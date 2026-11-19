@@ -20,6 +20,7 @@ from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -243,11 +244,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
         sp_cfg = getattr(self, "_stagepace_cfg", None)
-        if sp_cfg is not None and sp_cfg.enabled:
-            meta = extract_and_pop_stagepace_meta(request, default_slo_ms=sp_cfg.default_ttfa_slo_ms)
-            if meta is not None:
-                self._stagepace_req_meta[request.request_id] = meta
+        default_slo = sp_cfg.default_ttfa_slo_ms if sp_cfg is not None else 650.0
+        meta = extract_and_pop_stagepace_meta(request, default_slo_ms=default_slo)
+        if meta is not None and sp_cfg is not None and sp_cfg.enabled:
+            self._stagepace_req_meta[request.request_id] = meta
         super().add_request(request)
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        stats = super().make_stats(*args, **kwargs)
+        if stats is None and getattr(getattr(self, "_stagepace_cfg", None), "enabled", False):
+            kv_mgr = getattr(self, "kv_cache_manager", None)
+            usage = float(getattr(kv_mgr, "usage", 0.0) or 0.0) if kv_mgr is not None else 0.0
+            return SchedulerStats(
+                num_running_reqs=len(getattr(self, "running", ())),
+                num_waiting_reqs=len(getattr(self, "waiting", ())),
+                kv_cache_usage=usage,
+            )
+        return stats
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
         """Release admission fences after an ordered abort, never an eager one."""
@@ -855,14 +868,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        # Evaluate waiting-admission deferral BEFORE the Talker K-frame draft
-        # guard so deferred high-slack waiting prefills do not needlessly disarm
-        # active K-step multi-frame decode on Stage 1.
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
         original_wait_queues = None
-        if self._should_defer_waiting_admission():
-            original_wait_queues = self.waiting, self.kv_holding_waiting
-            self.waiting = create_request_queue(self.policy)
-            self.kv_holding_waiting = create_request_queue(self.policy)
+        if sp_ctrl is not None:
+            # StagePace Mechanism 2: evaluate waiting deferral BEFORE Talker K-frame
+            # guard so deferred high-slack waiting prefills do not disarm K-step decode.
+            if self._should_defer_waiting_admission():
+                original_wait_queues = self.waiting, self.kv_holding_waiting
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
+        else:
+            # Upstream default path (StagePace disabled): preserve exact call order.
+            self._drop_talker_drafts_if_prefill_pending()
+            if self._should_defer_waiting_admission():
+                original_wait_queues = self.waiting, self.kv_holding_waiting
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
 
         original_max_num_active_reqs = self.max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
@@ -872,12 +893,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
-            # Talker K-frame guard: a step whose decode spans would be uneven
-            # (mixed prefill+decode rows, or a first-step decode joining a
-            # steady-state K-step request) must not carry the K-step drafts --
-            # the multi-frame loop requires uniform decode spans and the runner
-            # refuses the rest.
-            self._drop_talker_drafts_if_prefill_pending()
+            if sp_ctrl is not None:
+                self._drop_talker_drafts_if_prefill_pending()
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
@@ -888,7 +905,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
-        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
         if sp_ctrl is not None and scheduler_output.total_num_scheduled_tokens > 0:
             if scheduler_output.scheduled_spec_decode_tokens:
                 sp_ctrl.talker_kstep_steps += 1
