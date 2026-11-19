@@ -33,6 +33,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pynvml
+import torch
 
 from benchmarks.qwen3_omni.costate_ch3_eval import (
     REVISION,
@@ -274,31 +275,33 @@ async def run_one_request(omni, entry: dict, *, ttfa_slo_ms: float) -> dict:
     try:
         async for out in omni.generate(
             prompt,
-            req_id,
+            request_id=req_id,
             sampling_params_list=params,
             output_modalities=modalities,
         ):
+            if getattr(out, "error", None):
+                raise RuntimeError(str(out.error))
             now = time.perf_counter()
-            if out.final_output_type == "text" and out.request_output is not None:
-                ro = out.request_output
-                if ro.prompt_token_ids:
-                    res["prompt_tokens"] = len(ro.prompt_token_ids)
-                if getattr(ro, "num_cached_tokens", None):
-                    res["cached_tokens"] = int(ro.num_cached_tokens)
-                if res["ttft_ms"] is None and ro.outputs and ro.outputs[0].token_ids:
-                    res["ttft_ms"] = (now - start) * 1000.0
-            elif out.final_output_type == "audio" and out.request_output is not None:
-                mm = getattr(out.request_output, "multimodal_output", None) or {}
+            elapsed = (now - start) * 1000.0
+            if getattr(out, "stage_id", None) == 0:
+                res["cached_tokens"] = max(res["cached_tokens"], int(getattr(out, "num_cached_tokens", 0) or 0))
+                ptoks = getattr(out, "prompt_token_ids", None)
+                if ptoks:
+                    res["prompt_tokens"] = len(ptoks)
+                for completion in getattr(out, "outputs", ()) or ():
+                    if getattr(completion, "token_ids", None) and res["ttft_ms"] is None:
+                        res["ttft_ms"] = elapsed
+            if want_audio and getattr(out, "final_output_type", None) == "audio":
+                mm = getattr(out, "multimodal_output", None) or {}
                 wav = mm.get("audio") if "audio" in mm else mm.get("model_outputs")
-                if wav is not None and hasattr(wav, "numel") and wav.numel() > 0:
+                if isinstance(wav, torch.Tensor) and wav.numel() > 0:
                     if first_audio_mono is None:
                         first_audio_mono = now
-                        res["first_audio_ms"] = (now - start) * 1000.0
+                        res["first_audio_ms"] = elapsed
                     else:
                         gap_ms = (now - audio_chunk_ts[-1]) * 1000.0
                         if gap_ms > res["max_audio_gap_ms"]:
                             res["max_audio_gap_ms"] = gap_ms
-                        # Underrun if wall time since first audio exceeded previously emitted playback duration
                         if (now - first_audio_mono) > emitted_audio_s + 0.01:
                             res["underrun_events"] += 1
                     audio_chunk_ts.append(now)
@@ -307,7 +310,10 @@ async def run_one_request(omni, entry: dict, *, ttfa_slo_ms: float) -> dict:
                     sr_val = int(sr.reshape(-1)[0]) if hasattr(sr, "reshape") else int(sr or 24000)
                     emitted_audio_s += float(wav.numel()) / max(1, sr_val)
         res["e2e_ms"] = (time.perf_counter() - start) * 1000.0
-        if want_audio and res["first_audio_ms"] is None:
+        if res["ttft_ms"] is None:
+            res["ok"] = False
+            res["error"] = "no_text_emitted"
+        elif want_audio and res["first_audio_ms"] is None:
             res["ok"] = False
             res["error"] = "no_audio_emitted"
     except Exception as exc:
