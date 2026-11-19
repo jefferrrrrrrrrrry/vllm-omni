@@ -49,8 +49,8 @@ def build_stagepace_dict(args) -> dict:
     mode = args.pace_mode
     token_cap = args.talker_kv_token_cap
     if token_cap <= 0 and args.talker_kv_mib > 0:
-        # ~22 KiB per token in Qwen3-Omni Talker KV pool -> proactive flight-time lease cap
-        token_cap = max(2048, int((args.talker_kv_mib * 1024) / 22))
+        # Exact physical capacity of Qwen3-Omni Talker KV pool: 20.0 KiB/token (13,088 tokens per 256 MiB)
+        token_cap = max(2048, int((args.talker_kv_mib * 1024) / 20))
     if mode == "f0_baseline":
         return {"enabled": False}
     if mode == "f1_static":
@@ -152,6 +152,7 @@ def build_deployment(args, namespace: str) -> dict:
 
     talker: dict = {
         "max_num_seqs": max_seqs,
+        "max_model_len": args.max_model_len,
         "gpu_memory_utilization": 0.35,
         "revision": REVISION,
         "subtalker_sampling_params": {"do_sample": False},
