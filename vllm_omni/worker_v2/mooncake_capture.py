@@ -61,7 +61,7 @@ class MooncakeOutputRewrite:
         self._consumed = True
         keys = {"embedding": "hidden_states.layer_0", "hidden": f"hidden_states.layer_{self.connector.hidden_layer}"}
         channels = (output.inter_stage_outputs, output.pooler_output, output.multimodal_outputs)
-        for entry in self.rows:
+        for entry in sorted(self.rows, key=lambda e: (e.start_token, e.row)):
             if output.request_errors and entry.req_id in output.request_errors:
                 continue
             payloads: list[dict[str, Any]] = []

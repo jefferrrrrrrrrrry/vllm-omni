@@ -895,6 +895,9 @@ class UnifiedPrefixDirectory:
         protected = {node.block_hash for node in chain}
 
         accepted_blocks = 0
+        new_kv_blocks = 0
+        new_hs_blocks = 0
+        full_bytes = max(1, self.kv_block_bytes + (self.hs_block_bytes if want_hs else 0))
         for node in chain:
             add_kv = not node.store_kv
             add_hs = want_hs and not node.store_hs
@@ -911,15 +914,19 @@ class UnifiedPrefixDirectory:
                         * (1.15 if node.block_hash in self._sketch_audio else 1.0)
                         * marginal_prefill_ms_per_block(node.depth)
                         * 1e6
-                        / max(1, need_bytes)
+                        / full_bytes
                     )
                     while self.store_bytes_used + need_bytes > max_store:
                         victim = self._select_eviction_victim(policy, protected)
                         if victim is None:
                             break
-                        if policy == "costate_utility" and self._leaf_utility_score(victim) > new_score * 1.05:
-                            victim = None
-                            break
+                        if policy == "costate_utility":
+                            if not want_hs and victim.store_hs:
+                                victim = None
+                                break
+                            if self._leaf_utility_score(victim) * 1.25 >= new_score:
+                                victim = None
+                                break
                         freed = self._node_store_bytes(victim)
                         victim.store_kv = False
                         victim.store_hs = False
@@ -933,14 +940,17 @@ class UnifiedPrefixDirectory:
             if add_kv:
                 node.store_kv = True
                 self.store_bytes_used += self.kv_block_bytes
+                new_kv_blocks += 1
             if add_hs:
                 node.store_hs = True
                 self.store_bytes_used += self.hs_block_bytes
+                new_hs_blocks += 1
             node.last_step = self.step_seq
             accepted_blocks += 1
 
-        if accepted_blocks > 0:
-            self.admitted_write_requests += 1
-        save_kv_tokens = accepted_blocks * self.block_size
-        save_hs_tokens = save_kv_tokens if want_hs else 0
+        if new_kv_blocks == 0 and new_hs_blocks == 0:
+            return 0, 0, evicted_hashes
+        self.admitted_write_requests += 1
+        save_kv_tokens = (accepted_blocks * self.block_size) if new_kv_blocks > 0 else 0
+        save_hs_tokens = (accepted_blocks * self.block_size) if (want_hs and new_hs_blocks > 0) else 0
         return save_kv_tokens, save_hs_tokens, evicted_hashes

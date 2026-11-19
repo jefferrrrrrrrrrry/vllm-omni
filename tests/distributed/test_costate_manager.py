@@ -306,6 +306,11 @@ def test_directory_store_tokens_and_l1_skip_guard() -> None:
     )
     assert (skv2, shs2) == (64, 64)
     assert directory.contiguous_store_tokens(chain, require_hs=True) == 64
+    # Subsequent turns on already-resident blocks must not trigger redundant Store re-saves
+    skv3, shs3, _ = directory.plan_store_write_and_evictions(
+        block_hashes=chain, target_tokens=64, is_text_only=False, avail_hs_blocks=100, computed_start_tokens=0
+    )
+    assert (skv3, shs3) == (0, 0)
 
 
 def test_worker_metadata_aggregation() -> None:

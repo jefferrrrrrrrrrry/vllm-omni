@@ -330,6 +330,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self._cost_gate: OnlineCostGate | None = None
         self._host_hs_cache: HostHSCache | None = None
         self._active_req_plans: dict[str, CoStateReqPlan] = {}
+        self._inflight_gpu_reqs: set[str] = set()
         self._ext_loaded_reqs: set[str] = set()
         self._ext_load_hs_flags: dict[str, bool] = {}
         self._pending_evict_hashes: list[bytes] = []
@@ -531,7 +532,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 # CoState v2 Fast-Path 2: Pre-lookup OnlineCostGate check avoids even
                 # sending a Mooncake lookup RPC when recompute beats L2 restore.
                 if self.settings.enable_cost_gate and self._cost_gate is not None:
-                    active_prefills = sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0)
+                    inflight = len(getattr(self, "_inflight_gpu_reqs", ()))
+                    active_prefills = max(
+                        inflight,
+                        sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0),
+                    )
                     preview = self._cost_gate.preview_external_tokens(
                         local_tokens=num_computed_tokens,
                         candidate_total_tokens=known_store,
@@ -611,7 +616,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             if candidate_total <= num_computed_tokens:
                 del self.connector_scheduler.load_specs[request.request_id]
                 return 0, False
-            active_prefills = sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0)
+            inflight = len(getattr(self, "_inflight_gpu_reqs", ()))
+            active_prefills = max(
+                inflight,
+                sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0),
+            )
             chosen_total = self._cost_gate.select_external_tokens(
                 local_tokens=num_computed_tokens,
                 candidate_total_tokens=candidate_total,
@@ -653,6 +662,12 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         if self.settings.enable_costate and self._cost_gate is not None:
             if num_external_tokens <= 0:
                 self._cost_gate.release_read(request.request_id)
+                if getattr(self, "_inflight_gpu_reqs", None) is not None:
+                    self._inflight_gpu_reqs.add(request.request_id)
+                if self.settings.enable_local_tier and self._costate_dir is not None:
+                    full_blocks = request.num_prompt_tokens // self.block_size
+                    prompt_hashes = [bytes(h) for h in request.block_hashes[:full_blocks]]
+                    self._costate_dir.record_shadow_host_hs(prompt_hashes)
             else:
                 self._ext_loaded_reqs.add(request.request_id)
 
@@ -727,7 +742,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             )
 
         # 2. Newly scheduled compute requests
-        wave_prefills = len(scheduler_output.scheduled_new_reqs)
+        wave_prefills = len(scheduler_output.scheduled_new_reqs) + len(
+            scheduler_output.scheduled_cached_reqs.req_ids
+        )
         for new_req in scheduler_output.scheduled_new_reqs:
             rid = new_req.req_id
             req_tuple = self.connector_scheduler._unfinished_requests.get(rid)
@@ -776,7 +793,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 ext_load_hs=ext_need_hs,
                 save_store_kv_tokens=save_kv,
                 save_store_hs_tokens=save_hs,
-                save_host_hs=bool(self.settings.enable_local_tier and not tonly),
+                save_host_hs=bool(self.settings.enable_local_tier),
                 promote_from_host_hs_tokens=promote_tok,
             )
             self._active_req_plans[rid] = plan
@@ -829,7 +846,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     ext_load_hs=ext_need_hs,
                     save_store_kv_tokens=save_kv,
                     save_store_hs_tokens=save_hs,
-                    save_host_hs=bool(self.settings.enable_local_tier and not tonly),
+                    save_host_hs=bool(self.settings.enable_local_tier),
                     promote_from_host_hs_tokens=min(local_kv_tok, save_hs) if (local_kv_tok > 0 and save_hs > 0) else 0,
                 )
                 self._active_req_plans[rid] = plan
@@ -849,6 +866,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> JointMetadata:
         retired = set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ())
         active_plans = getattr(self, "_active_req_plans", None)
+        inflight_reqs = getattr(self, "_inflight_gpu_reqs", None)
         ext_loaded = getattr(self, "_ext_loaded_reqs", None)
         ext_hs_flags = getattr(self, "_ext_load_hs_flags", None)
         for req_id in retired:
@@ -857,6 +875,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             self._bypass.discard(req_id)
             if active_plans is not None:
                 active_plans.pop(req_id, None)
+            if inflight_reqs is not None:
+                inflight_reqs.discard(req_id)
             if ext_loaded is not None:
                 ext_loaded.discard(req_id)
             if ext_hs_flags is not None:
@@ -1519,7 +1539,12 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 return None
 
             # CoState Mechanism 1A: Text-only turns terminate at Stage 0 without Talker HS
+            # assembly or L2 Store HS write, but still stage newly computed prompt slices
+            # into Tier-2 HostHSCache (<0.15 ms contiguous CPU slab copy) so subsequent
+            # Audio turns on the same session can reuse L1 GPU KV + HostHSCache HS.
             if self.settings.enable_costate and self.settings.enable_modality_decouple and attempt.is_text_only:
+                if attempt.save_host_hs and start_token < prompt_len:
+                    self._stage_host_hs_blocks(attempt, start_token, tensors)
                 return tensors
 
             merged: dict[str, torch.Tensor] | None = None
