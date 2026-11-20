@@ -459,6 +459,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._stagepace_seen_hashes: set[bytes] = set()
         stage_id = int(getattr(self.vllm_config.model_config, "stage_id", 0) or 0)
         self._stagepace_stage_id = stage_id
+        self._chunked_prefill_budget_waits = 0
         self._stagepace_ctrl: SlackBatchController | None = (
             SlackBatchController(self._stagepace_cfg)
             if (
@@ -964,30 +965,34 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
-        if sp_ctrl is not None and scheduler_output.total_num_scheduled_tokens > 0:
+        if scheduler_output.total_num_scheduled_tokens > 0:
             if int(getattr(self, "_stagepace_stage_id", 0) or 0) == 0:
                 bsize = int(getattr(getattr(self, "cache_config", None), "block_size", 16) or 16)
                 max_sched_tok = int(getattr(self, "max_num_scheduled_tokens", 0) or 0)
                 if len(self.waiting) > 0 and max_sched_tok > 0 and (
                     scheduler_output.total_num_scheduled_tokens >= max_sched_tok - bsize
                 ):
-                    sp_ctrl.chunked_prefill_budget_waits += len(self.waiting)
-                has_cache = bool(
-                    getattr(getattr(self, "cache_config", None), "enable_prefix_caching", False)
-                    or getattr(self, "connector", None) is not None
-                )
-                if has_cache:
-                    for req_id in scheduler_output.num_scheduled_tokens:
-                        req_obj = self.requests.get(req_id)
-                        if req_obj is not None:
-                            for bh in getattr(req_obj, "block_hashes", None) or ():
-                                self._stagepace_seen_hashes.add(bytes(bh))
-                    if len(self._stagepace_seen_hashes) > 16384:
-                        self._stagepace_seen_hashes.clear()
-            elif scheduler_output.scheduled_spec_decode_tokens:
-                sp_ctrl.talker_kstep_steps += 1
-            else:
-                sp_ctrl.talker_single_frame_steps += 1
+                    self._chunked_prefill_budget_waits += len(self.waiting)
+                    if sp_ctrl is not None:
+                        sp_ctrl.chunked_prefill_budget_waits += len(self.waiting)
+                if sp_ctrl is not None:
+                    has_cache = bool(
+                        getattr(getattr(self, "cache_config", None), "enable_prefix_caching", False)
+                        or getattr(self, "connector", None) is not None
+                    )
+                    if has_cache:
+                        for req_id in scheduler_output.num_scheduled_tokens:
+                            req_obj = self.requests.get(req_id)
+                            if req_obj is not None:
+                                for bh in getattr(req_obj, "block_hashes", None) or ():
+                                    self._stagepace_seen_hashes.add(bytes(bh))
+                        if len(self._stagepace_seen_hashes) > 16384:
+                            self._stagepace_seen_hashes.clear()
+            elif sp_ctrl is not None:
+                if scheduler_output.scheduled_spec_decode_tokens:
+                    sp_ctrl.talker_kstep_steps += 1
+                else:
+                    sp_ctrl.talker_single_frame_steps += 1
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
@@ -2495,6 +2500,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self.requests_needing_kv_transfer.clear()
         return requests
+
+    def shutdown(self) -> None:
+        stage_id = int(getattr(self, "_stagepace_stage_id", 0) or 0)
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
+        if sp_ctrl is not None or getattr(self, "_chunked_prefill_budget_waits", 0) > 0:
+            diag = sp_ctrl.snapshot_diagnostics() if sp_ctrl is not None else {}
+            diag["chunked_prefill_budget_waits"] = int(getattr(self, "_chunked_prefill_budget_waits", 0))
+            logger.info("[StagePace][Stage-%d] summary: %s", stage_id, diag)
+        super().shutdown()
 
 
 class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):

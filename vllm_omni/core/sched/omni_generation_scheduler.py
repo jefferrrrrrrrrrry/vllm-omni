@@ -1289,3 +1289,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
         self._replace_streaming_session(session, update)
+
+    def shutdown(self) -> None:
+        sp_ctrl = getattr(self, "_stagepace_ctrl", None)
+        if sp_ctrl is not None:
+            logger.info("[StagePace][Stage-2] summary: %s", sp_ctrl.snapshot_diagnostics())
+        super().shutdown()

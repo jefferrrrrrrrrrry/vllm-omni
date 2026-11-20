@@ -37,7 +37,7 @@ from tests.engine import kv_offload_helpers as helpers
 from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
 REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
-MODES = ("off", "local_only", "pr10107", "pr10107_tuned", "topo_lru", "costate_ext", "costate")
+MODES = ("off", "local_only", "pr10107", "pr10491", "pr10107_tuned", "topo_lru", "costate_ext", "costate")
 
 
 class CoStateEvalWorker(GPUARWorker):
@@ -93,7 +93,9 @@ class CoStateEvalWorker(GPUARWorker):
             tracked_bind._costate_eval_wrapped = True  # type: ignore[attr-defined]
             OmniMooncakeStoreConnector.bind_connector_metadata = tracked_bind
 
-        if not getattr(OmniMooncakeStoreConnector._read_hs_range, "_costate_eval_wrapped", False):
+        if hasattr(OmniMooncakeStoreConnector, "_read_hs_range") and not getattr(
+            OmniMooncakeStoreConnector._read_hs_range, "_costate_eval_wrapped", False
+        ):
             orig_read_range = OmniMooncakeStoreConnector._read_hs_range
 
             def timed_read_range(conn_self, attempt, start_tokens, end_tokens, prefix_tensors=None):
@@ -110,6 +112,26 @@ class CoStateEvalWorker(GPUARWorker):
 
             timed_read_range._costate_eval_wrapped = True  # type: ignore[attr-defined]
             OmniMooncakeStoreConnector._read_hs_range = timed_read_range
+        elif hasattr(OmniMooncakeStoreConnector, "_read_hs") and not getattr(
+            OmniMooncakeStoreConnector._read_hs, "_costate_eval_wrapped", False
+        ):
+            orig_read_hs = OmniMooncakeStoreConnector._read_hs
+
+            def timed_read_hs(conn_self, attempt, tokens):
+                t0 = time.perf_counter()
+                out = orig_read_hs(conn_self, attempt, tokens)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                owner = getattr(conn_self, "_eval_owner", None)
+                if owner is not None:
+                    local_toks = int(getattr(attempt, "local_tokens", 0) or 0)
+                    with owner._diag_lock:
+                        owner._diag["ext_hs_reads"] += 1
+                        owner._diag["ext_hs_read_ms"].append(dt_ms)
+                        owner._diag["ext_hs_read_tokens"].append(max(0, int(tokens) - local_toks))
+                return out
+
+            timed_read_hs._costate_eval_wrapped = True  # type: ignore[attr-defined]
+            OmniMooncakeStoreConnector._read_hs = timed_read_hs
 
         if not getattr(OmniMooncakeStoreConnector._save_hs, "_costate_eval_wrapped", False):
             orig_save_hs = OmniMooncakeStoreConnector._save_hs
@@ -156,7 +178,7 @@ class CoStateEvalWorker(GPUARWorker):
         super().init_device()
         runner_kc = getattr(getattr(self, "model_runner", None), "kv_connector", None)
         inner_conn = getattr(runner_kc, "kv_connector", runner_kc)
-        if inner_conn is not None and hasattr(inner_conn, "audit_store_prefix_chains"):
+        if inner_conn is not None and isinstance(inner_conn, OmniMooncakeStoreConnector):
             self._connector_ref = inner_conn
             inner_conn._eval_owner = self
             if getattr(inner_conn, "connector_worker", None) is not None:
@@ -260,7 +282,7 @@ def deployment(
     enable_host_hs_cache: bool = True,
     enable_cost_gate: bool = True,
 ) -> dict:
-    enable_local = mode in ("local_only", "costate")
+    enable_local = mode in ("local_only", "pr10491", "costate")
     thinker: dict = {
         "use_v2_model_runner": True,
         "worker_cls": "benchmarks.qwen3_omni.costate_ch3_eval.CoStateEvalWorker",
@@ -286,6 +308,10 @@ def deployment(
         if mode == "pr10107":
             mc_cfg["max_hs_bytes"] = 256 * 1024 * 1024
             mc_cfg["enable_costate"] = False
+        elif mode == "pr10491":
+            # Upstream PR #10491: GPU local KV + slot-coupled CPU HS pool + Mooncake L2,
+            # given the same 1 GiB HS staging budget as CoState for fair comparison.
+            mc_cfg["max_hs_bytes"] = 1024 * 1024 * 1024
         elif mode == "pr10107_tuned":
             mc_cfg.update(
                 max_hs_bytes=1024 * 1024 * 1024,

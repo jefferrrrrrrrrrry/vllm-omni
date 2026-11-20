@@ -1821,6 +1821,22 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         if getattr(self, "_closed", True):
             return
         self._closed = True
+        if self._costate_gate is not None:
+            g = self._costate_gate
+            d = self._costate_dir
+            summary = {
+                "gate_eval_calls": g.gate_eval_calls,
+                "mean_gate_eval_us": round(g.gate_eval_time_us / g.gate_eval_calls, 2) if g.gate_eval_calls > 0 else 0.0,
+                "ema_kv_ms_per_block": round(g.ema_kv_ms_per_block, 4),
+                "ema_hs_ms_per_block": round(g.ema_hs_ms_per_block, 4),
+                "decisions_restore": g.decisions_restore,
+                "decisions_bypass_cost": g.decisions_bypass_cost,
+                "decisions_truncated_budget": g.decisions_truncated_budget,
+                "decisions_write_deferred": g.decisions_write_deferred,
+                "dir_nodes": len(d._nodes) if d is not None else 0,
+                "dir_store_bytes": d.store_bytes if d is not None else 0,
+            }
+            logger.info("[CoState] scheduler summary: %s", summary)
         with self._lock:
             # Saves of normally finished requests may still wait for KV.
             for attempt in [*self._attempts.values(), *(save.attempt for save in self._saves.values())]:
