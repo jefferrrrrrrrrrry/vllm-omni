@@ -478,6 +478,33 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 bool(self._stagepace_cfg.enable_talker_slack_coalesce and stage_id > 0),
             )
 
+    def _estimate_stage0_cached_tokens(self, request: Request) -> int:
+        local_hit = 0
+        if getattr(getattr(self, "cache_config", None), "enable_prefix_caching", False):
+            try:
+                coord = getattr(getattr(self, "kv_cache_manager", None), "coordinator", None)
+                bhashes = getattr(request, "block_hashes", None)
+                max_hit = max(0, int(getattr(request, "num_tokens", 0) or 0) - 1)
+                if coord is not None and bhashes and hasattr(coord, "find_longest_cache_hit"):
+                    _, local_hit, _ = coord.find_longest_cache_hit(bhashes, max_hit)
+                else:
+                    _, local_hit, _, _ = super()._get_local_prefix_cache_hit(request, None)
+            except Exception:
+                local_hit = 0
+        connector = getattr(self, "connector", None)
+        est_fn = getattr(connector, "estimate_effective_cached_tokens", None)
+        if callable(est_fn):
+            return int(est_fn(request, local_hit))
+        if local_hit > 0:
+            return int(local_hit)
+        bsize = int(getattr(getattr(self, "cache_config", None), "block_size", 16) or 16)
+        matched = 0
+        for bh in getattr(request, "block_hashes", None) or ():
+            if bytes(bh) not in self._stagepace_seen_hashes:
+                break
+            matched += bsize
+        return matched
+
     def _reorder_waiting_by_stagepace(self) -> None:
         ctrl = getattr(self, "_stagepace_ctrl", None)
         if ctrl is None or not self._stagepace_cfg.enable_work_aware_reorder or len(self.waiting) <= 1:
@@ -491,6 +518,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             seen_hashes=self._stagepace_seen_hashes,
             block_size=bsize,
             is_stage_zero_final_fn=self._request_omits_chunk_transfer_to_next_stage if stage_id == 0 else None,
+            estimate_cached_tokens_fn=self._estimate_stage0_cached_tokens if stage_id == 0 else None,
             ready_ts_map=self._stagepace_ready_ts,
         )
         if any(a is not b for a, b in zip(ordered, waiting_list)):
@@ -938,6 +966,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if sp_ctrl is not None and scheduler_output.total_num_scheduled_tokens > 0:
             if int(getattr(self, "_stagepace_stage_id", 0) or 0) == 0:
+                bsize = int(getattr(getattr(self, "cache_config", None), "block_size", 16) or 16)
+                max_sched_tok = int(getattr(self, "max_num_scheduled_tokens", 0) or 0)
+                if len(self.waiting) > 0 and max_sched_tok > 0 and (
+                    scheduler_output.total_num_scheduled_tokens >= max_sched_tok - bsize
+                ):
+                    sp_ctrl.chunked_prefill_budget_waits += len(self.waiting)
                 has_cache = bool(
                     getattr(getattr(self, "cache_config", None), "enable_prefix_caching", False)
                     or getattr(self, "connector", None) is not None

@@ -39,6 +39,7 @@ class MooncakeConfig:
     # CoState modular switches (defaults keep vanilla #10107 behavior unchanged)
     enable_costate: bool = False
     enable_local_tier: bool = False
+    enable_host_hs_cache: bool = True
     enable_modality_decouple: bool = False
     enable_cost_gate: bool = False
     min_write_hits: int = 1
@@ -62,6 +63,7 @@ class MooncakeConfig:
         for flag in (
             "enable_costate",
             "enable_local_tier",
+            "enable_host_hs_cache",
             "enable_modality_decouple",
             "enable_cost_gate",
             "sync_write_truncation",

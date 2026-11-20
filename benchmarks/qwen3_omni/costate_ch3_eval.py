@@ -257,6 +257,8 @@ def deployment(
     max_store_bytes: int,
     host_hs_bytes: int,
     force_min_write_hits: int | None = None,
+    enable_host_hs_cache: bool = True,
+    enable_cost_gate: bool = True,
 ) -> dict:
     enable_local = mode in ("local_only", "costate")
     thinker: dict = {
@@ -328,8 +330,9 @@ def deployment(
                 max_hs_bytes=1024 * 1024 * 1024,
                 enable_costate=True,
                 enable_local_tier=True,
+                enable_host_hs_cache=enable_host_hs_cache,
                 enable_modality_decouple=True,
-                enable_cost_gate=True,
+                enable_cost_gate=enable_cost_gate,
                 min_write_hits=force_min_write_hits or 2,
                 eviction_policy="costate_utility",
                 sync_write_truncation=True,
@@ -803,6 +806,8 @@ async def run_eval(args) -> None:
         max_store_bytes=args.max_store_mib * 1024**2,
         host_hs_bytes=args.host_hs_mib * 1024**2,
         force_min_write_hits=1 if args.suite == "exactness" else None,
+        enable_host_hs_cache=not args.disable_host_hs,
+        enable_cost_gate=not args.disable_cost_gate,
     )
 
     report = {
@@ -884,6 +889,8 @@ def main() -> None:
     parser.add_argument("--host-hs-mib", type=int, default=256)
     parser.add_argument("--spill-len", type=int, default=4096)
     parser.add_argument("--spill-sessions", type=int, default=4)
+    parser.add_argument("--disable-host-hs", action="store_true")
+    parser.add_argument("--disable-cost-gate", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     asyncio.run(run_eval(args))

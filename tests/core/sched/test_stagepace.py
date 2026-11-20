@@ -315,3 +315,65 @@ def test_stage0_and_stage1_work_aware_waiting_queue_reorder() -> None:
         now_wall=now,
     )
     assert [r.request_id for r in ordered_aged] == ["cold-aged", "hot-audio"]
+
+
+def test_explicit_costate_handoff_and_cache_blind_sjf() -> None:
+    now = 4000.0
+    shared_hashes = [f"sh-{i}".encode() for i in range(175)]  # 2800 tokens historically seen
+    seen = set(shared_hashes)
+
+    # Request H: 2824 prompt tokens, 2800 cached -> only 24 remaining tokens!
+    # Request M: 1600 prompt tokens, 0 cached -> 1600 remaining tokens!
+    req_hot_long = SimpleNamespace(
+        request_id="hot-2824",
+        prompt_token_ids=[1] * 2824,
+        num_computed_tokens=0,
+        block_hashes=shared_hashes + [b"tail"],
+        arrival_time=now,
+        is_text=False,
+    )
+    req_cold_medium = SimpleNamespace(
+        request_id="cold-1600",
+        prompt_token_ids=[1] * 1600,
+        num_computed_tokens=0,
+        block_hashes=[b"cold-m"],
+        arrival_time=now - 0.01,
+        is_text=False,
+    )
+
+    # 1. StagePace with explicit CoState k* (2800 cached): hot-2824 (24 rem) beats cold-1600 (1600 rem)
+    ctrl_sp = SlackBatchController(StagePaceConfig(enabled=True, enable_work_aware_reorder=True))
+    ord_sp = ctrl_sp.order_waiting_requests(
+        [req_cold_medium, req_hot_long],
+        stage_id=0,
+        seen_hashes=seen,
+        estimate_cached_tokens_fn=lambda r: 2800 if r.request_id == "hot-2824" else 0,
+        now_wall=now,
+    )
+    assert [r.request_id for r in ord_sp] == ["hot-2824", "cold-1600"]
+    assert ctrl_sp.explicit_costate_queries == 2
+
+    # 2. If CoState's OnlineCostGate bypassed external restore after L1 eviction (k* = 0),
+    #    explicit handoff prevents stale seen_hashes from misclassifying hot-2824 as a 24-token hit!
+    ord_bypassed = ctrl_sp.order_waiting_requests(
+        [req_cold_medium, req_hot_long],
+        stage_id=0,
+        seen_hashes=seen,
+        estimate_cached_tokens_fn=lambda r: 0,
+        now_wall=now,
+    )
+    assert [r.request_id for r in ord_bypassed] == ["cold-1600", "hot-2824"]
+
+    # 3. Cache-Blind SJF (cache_blind_sjf=True): sees only raw prompt lengths (1600 < 2824),
+    #    so it mistakenly schedules cold-1600 ahead of the 24-token cache hit!
+    ctrl_blind = SlackBatchController(
+        StagePaceConfig(enabled=True, enable_work_aware_reorder=True, cache_blind_sjf=True)
+    )
+    ord_blind = ctrl_blind.order_waiting_requests(
+        [req_cold_medium, req_hot_long],
+        stage_id=0,
+        seen_hashes=seen,
+        estimate_cached_tokens_fn=lambda r: 2800 if r.request_id == "hot-2824" else 0,
+        now_wall=now,
+    )
+    assert [r.request_id for r in ord_blind] == ["cold-1600", "hot-2824"]

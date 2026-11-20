@@ -333,6 +333,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self._inflight_gpu_reqs: set[str] = set()
         self._ext_loaded_reqs: set[str] = set()
         self._ext_load_hs_flags: dict[str, bool] = {}
+        self._effective_cache_memo: dict[str, tuple[int, int, int, int]] = {}
         self._pending_evict_hashes: list[bytes] = []
         self._pending_worker_meta = CoStateWorkerMetadata()
         self.settings = MooncakeConfig.from_vllm_config(vllm_config)
@@ -497,6 +498,79 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             cap = min(cap, max_cache_hit_length)
         return cap
 
+    def estimate_effective_cached_tokens(self, request: Request, local_kv_tokens: int = 0) -> int:
+        """Read-only estimate of effective reusable prefix tokens ``k*`` for StagePace.
+
+        Combines local L1 hit eligibility with CoState's directory and OnlineCostGate
+        preview so Stage 0 queue ordering reflects gate-confirmed recovery rather than
+        stale block-hash history. Memoized in O(1) while directory state is unchanged.
+        """
+        prompt_len = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        prompt_limit = max(0, (prompt_len - 1) // self.block_size * self.block_size)
+        local_tok = min(prompt_limit, max(0, int(local_kv_tokens) - (int(local_kv_tokens) % self.block_size)))
+        if not self.settings.enable_costate or self._costate_dir is None:
+            return local_tok if self.settings.enable_local_tier else 0
+
+        rid = request.request_id
+        ver = self._costate_dir.state_version
+        q_reads = self._cost_gate.active_read_count if self._cost_gate is not None else 0
+        memo = getattr(self, "_effective_cache_memo", None)
+        if memo is not None:
+            cached = memo.get(rid)
+            if cached is not None and cached[0] == local_tok and cached[1] == ver and cached[2] == q_reads:
+                return cached[3]
+
+        full_blocks = prompt_len // self.block_size
+        prompt_hashes = [bytes(h) for h in request.block_hashes[:full_blocks]]
+        text_only = is_text_only_request(request) if self.settings.enable_modality_decouple else False
+        usable_local = 0
+        if self.settings.enable_local_tier and local_tok > 0:
+            usable_local = (
+                local_tok
+                if text_only
+                else min(local_tok, self._costate_dir.contiguous_hs_tokens(prompt_hashes))
+            )
+
+        effective = usable_local
+        if rid not in self._bypass and usable_local < prompt_limit:
+            raw_host_hs = (
+                self._costate_dir.contiguous_host_hs_tokens(prompt_hashes)
+                if self.settings.enable_local_tier
+                else 0
+            )
+            host_hs_tok = raw_host_hs if self.settings.enable_host_hs_cache else min(usable_local, raw_host_hs)
+            known_store = min(
+                prompt_limit,
+                self._costate_dir.contiguous_store_tokens(
+                    prompt_hashes, require_hs=not text_only, host_hs_tokens=host_hs_tok
+                ),
+            )
+            if known_store > usable_local:
+                if self.settings.enable_cost_gate and self._cost_gate is not None:
+                    inflight = len(getattr(self, "_inflight_gpu_reqs", ()))
+                    active_prefills = max(
+                        inflight,
+                        sum(1 for p in self._active_req_plans.values() if p.ext_load_tokens == 0),
+                    )
+                    preview = self._cost_gate.preview_external_tokens(
+                        local_tokens=usable_local,
+                        candidate_total_tokens=known_store,
+                        is_text_only=text_only,
+                        host_hs_tokens=host_hs_tok,
+                        enable_cost_gate=True,
+                        active_gpu_prefills=active_prefills,
+                        prompt_tokens=prompt_len,
+                    )
+                    effective = max(usable_local, preview - (preview % self.block_size))
+                else:
+                    effective = known_store
+
+        if memo is not None:
+            if len(memo) > 4096:
+                memo.clear()
+            memo[rid] = (local_tok, ver, q_reads, effective)
+        return effective
+
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
         req_id = request.request_id
@@ -515,10 +589,15 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             # CoState v2 Fast-Path 1: Skip Mooncake RPC when UnifiedPrefixDirectory
             # already knows L2 Store holds no blocks beyond the local L1 hit.
             if self.settings.enable_directory_lookup_filter:
-                host_hs_tok = (
+                raw_host_hs = (
                     self._costate_dir.contiguous_host_hs_tokens(prompt_hashes)
                     if self.settings.enable_local_tier
                     else 0
+                )
+                host_hs_tok = (
+                    raw_host_hs
+                    if self.settings.enable_host_hs_cache
+                    else min(num_computed_tokens, raw_host_hs)
                 )
                 known_store = min(
                     prompt_limit,
@@ -544,6 +623,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                         host_hs_tokens=host_hs_tok,
                         enable_cost_gate=True,
                         active_gpu_prefills=active_prefills,
+                        prompt_tokens=request.num_prompt_tokens,
                     )
                     if preview - (preview % self.block_size) <= num_computed_tokens:
                         self._cost_gate.decisions_bypass_cost += 1
@@ -603,10 +683,15 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             self._costate_dir.observe_lookup(prompt_hashes, kv_hit, joint_hit)
             text_only = is_text_only_request(request) if self.settings.enable_modality_decouple else False
             limit = max(0, (request.num_prompt_tokens - 1) // self.block_size * self.block_size)
-            host_hs_tok = (
+            raw_host_hs = (
                 self._costate_dir.contiguous_host_hs_tokens(prompt_hashes)
                 if self.settings.enable_local_tier
                 else 0
+            )
+            host_hs_tok = (
+                raw_host_hs
+                if self.settings.enable_host_hs_cache
+                else min(num_computed_tokens, raw_host_hs)
             )
             # Cross-tier decoupling (Cut #4): blocks whose HS already resides in
             # hash-indexed HostHSCache only need KV from L2 Store (0 L2 HS read!).
@@ -628,6 +713,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 host_hs_tokens=host_hs_tok,
                 enable_cost_gate=self.settings.enable_cost_gate,
                 active_gpu_prefills=active_prefills,
+                prompt_tokens=request.num_prompt_tokens,
             )
             chosen_total -= chosen_total % self.block_size
             if chosen_total <= num_computed_tokens:
@@ -638,7 +724,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             hs_needed = 0 if text_only else max(0, chosen_total - host_hs_tok)
             if getattr(self, "_ext_load_hs_flags", None) is not None:
                 self._ext_load_hs_flags[request.request_id] = hs_needed > 0
-            self._cost_gate.reserve_read(request.request_id, hs_needed)
+            ext_kv_blks = max(0, (chosen_total - num_computed_tokens) // self.block_size)
+            self._cost_gate.reserve_read(request.request_id, hs_needed, ext_kv_blocks=ext_kv_blks)
             return chosen_total - num_computed_tokens, load_async
 
         spec = self.connector_scheduler.load_specs.get(request.request_id)
@@ -689,9 +776,12 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 ext_loaded.discard(req_id)
             if self._cost_gate is not None:
                 self._cost_gate.release_read(req_id)
+        e2e_kv_samples: list[float] = []
         for req_id in connector_output.finished_recving or ():
             if self._cost_gate is not None:
-                self._cost_gate.release_read(req_id)
+                kv_sample = self._cost_gate.complete_read(req_id)
+                if kv_sample is not None:
+                    e2e_kv_samples.append(kv_sample)
             if req_id not in self._bypass:
                 continue
             # Rotate only after native copies drain and recovery can run.
@@ -703,7 +793,10 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             wmeta = connector_output.kv_connector_worker_meta
             if isinstance(wmeta, CoStateWorkerMetadata):
                 self._costate_dir.reconcile_worker_meta(wmeta)
-                self._cost_gate.update_ema(wmeta.obs_ext_kv_ms_per_block, wmeta.obs_ext_hs_ms_per_block)
+                kv_samples = e2e_kv_samples or wmeta.obs_ext_kv_ms_per_block
+                self._cost_gate.update_ema(kv_samples, wmeta.obs_ext_hs_ms_per_block)
+            elif e2e_kv_samples:
+                self._cost_gate.update_ema(e2e_kv_samples, [])
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
@@ -869,6 +962,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         inflight_reqs = getattr(self, "_inflight_gpu_reqs", None)
         ext_loaded = getattr(self, "_ext_loaded_reqs", None)
         ext_hs_flags = getattr(self, "_ext_load_hs_flags", None)
+        eff_memo = getattr(self, "_effective_cache_memo", None)
         for req_id in retired:
             self._scheduler_attempts.pop(req_id, None)
             self._lookup_started.pop(req_id, None)
@@ -881,6 +975,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 ext_loaded.discard(req_id)
             if ext_hs_flags is not None:
                 ext_hs_flags.pop(req_id, None)
+            if eff_memo is not None:
+                eff_memo.pop(req_id, None)
             if self._cost_gate is not None:
                 self._cost_gate.release_read(req_id)
                 self._cost_gate.release_save(req_id)
@@ -1167,6 +1263,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     host_avail = self._host_hs_cache.contiguous_tokens(
                         attempt.hashes[:total_blocks], self.block_size
                     )
+                    if not self.settings.enable_host_hs_cache:
+                        host_avail = min(local_tokens, host_avail)
                     if host_avail >= tokens:
                         # 100% of HS prefix already warm in HostHSCache -> L2 pulls PURE KV!
                         pending = PendingRead(

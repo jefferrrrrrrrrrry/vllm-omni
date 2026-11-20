@@ -17,6 +17,7 @@ Implements the four components of CoState:
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -356,15 +357,13 @@ class PrefixNode:
 
 def marginal_prefill_ms_per_block(depth: int) -> float:
     """Calibrated per-16-token-block prefill cost on Qwen3-Omni-30B-A3B (RTX PRO 6000)."""
-    if depth < 32:
-        return 0.45
     if depth < 128:
-        return 0.55
+        return 0.45
     if depth < 256:
-        return 0.78
+        return 0.55
     if depth < 512:
-        return 1.05
-    return 1.35
+        return 1.15
+    return 1.40
 
 
 class OnlineCostGate:
@@ -384,23 +383,25 @@ class OnlineCostGate:
         self.max_hs_bytes = max_hs_bytes
         self.max_pending_transfers = max_pending_transfers
         self.header_allowance = header_allowance
-        # Calibrated from Wave 1A + RTX PRO 6000 Qwen3-Omni-30B-A3B profiling:
-        # Pure L2 KV transfer is fast (~0.28 ms/blk), whereas L2 HS + safetensors
-        # per-block deserialization is the bottleneck (~0.66 ms/blk). When Cut #4
-        # supplies HS from HostHSCache (ext_hs_blocks=0), L2 KV-only restore beats
-        # MoE GPU recomputation even at 4K tokens!
-        self.ema_kv_ms_per_block = 0.28
+        # End-to-end scheduler-to-scheduler per-block transfer rate priors (ms/block),
+        # adapted online via EMA over observed complete_read() / worker samples.
+        self.ema_kv_ms_per_block = 0.54
         self.ema_hs_ms_per_block = 0.66
-        self.base_prefill_launch_ms = 42.0
+        # Sparse-suffix vs dense-prefill MoE expert activation step (36 ms when
+        # skipping prefix reduces suffix below full 128-expert activation).
+        self.sparse_suffix_expert_saved_ms = 36.0
         self.base_restore_rpc_ms = 18.0
         self.restore_safety_margin = 1.08
 
         self._active_reads: dict[str, int] = {}
+        self._read_meta: dict[str, tuple[float, int]] = {}
         self._active_saves: dict[str, int] = {}
         self.decisions_restore = 0
         self.decisions_bypass_cost = 0
         self.decisions_truncated_budget = 0
         self.decisions_write_deferred = 0
+        self.gate_eval_calls = 0
+        self.gate_eval_time_us = 0.0
 
     @property
     def shadow_hs_bytes(self) -> int:
@@ -423,12 +424,37 @@ class OnlineCostGate:
             if 0.02 <= val <= 10.0:
                 self.ema_hs_ms_per_block = (1.0 - alpha) * self.ema_hs_ms_per_block + alpha * val
 
-    def reserve_read(self, req_id: str, hs_tokens: int) -> None:
+    def reserve_read(
+        self,
+        req_id: str,
+        hs_tokens: int,
+        *,
+        ext_kv_blocks: int = 0,
+        now_perf: float | None = None,
+    ) -> None:
         reserve = (3 * hs_tokens * self.row_bytes + self.header_allowance) if hs_tokens > 0 else 0
         self._active_reads[req_id] = reserve
+        t0 = time.perf_counter() if now_perf is None else now_perf
+        self._read_meta[req_id] = (t0, max(0, int(ext_kv_blocks)))
+
+    def complete_read(self, req_id: str, *, now_perf: float | None = None) -> float | None:
+        """Release read reservation and return end-to-end ms/block sample if measured."""
+        self._active_reads.pop(req_id, None)
+        meta = self._read_meta.pop(req_id, None)
+        if meta is None:
+            return None
+        t0, kv_blks = meta
+        if kv_blks <= 0:
+            return None
+        t1 = time.perf_counter() if now_perf is None else now_perf
+        net_ms = max(0.0, (t1 - t0) * 1000.0 - self.base_restore_rpc_ms)
+        if net_ms <= 0.0:
+            return None
+        return net_ms / kv_blks
 
     def release_read(self, req_id: str) -> None:
         self._active_reads.pop(req_id, None)
+        self._read_meta.pop(req_id, None)
 
     def reserve_save(self, req_id: str, hs_tokens: int, kv_tokens: int = 0) -> None:
         if hs_tokens > 0:
@@ -445,15 +471,21 @@ class OnlineCostGate:
         return free_bytes // per_block_reserve if per_block_reserve > 0 else 0
 
     def estimate_prefill_saved_ms(
-        self, start_tokens: int, end_tokens: int, active_gpu_prefills: int = 0
+        self,
+        start_tokens: int,
+        end_tokens: int,
+        active_gpu_prefills: int = 0,
+        *,
+        prompt_tokens: int | None = None,
     ) -> float:
         start_blk = start_tokens // self.block_size
         end_blk = end_tokens // self.block_size
         if end_blk <= start_blk:
             return 0.0
         compute_ms = sum(marginal_prefill_ms_per_block(b) for b in range(start_blk, end_blk))
-        if start_blk == 0:
-            compute_ms += self.base_prefill_launch_ms * min(1.0, (end_blk - start_blk) / 28.0)
+        rem_suffix = 0 if prompt_tokens is None else max(0, int(prompt_tokens) - end_tokens)
+        if start_blk == 0 and rem_suffix < 64:
+            compute_ms += self.sparse_suffix_expert_saved_ms * min(1.0, (end_blk - start_blk) / 28.0)
         return compute_ms * (1.0 + 0.32 * max(0, active_gpu_prefills))
 
     def estimate_restore_ms(
@@ -493,6 +525,7 @@ class OnlineCostGate:
         host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
+        prompt_tokens: int | None = None,
         record_stats: bool = True,
     ) -> int:
         ext_tokens = candidate_total_tokens - local_tokens
@@ -532,14 +565,20 @@ class OnlineCostGate:
             return target_total
 
         # 2. Compare estimated external restore latency against MoE GPU prefill savings
+        t_gate0 = time.perf_counter()
         ext_kv_blocks = (target_total - local_tokens) // self.block_size
         if is_text_only:
             ext_hs_blocks = 0
         else:
             ext_hs_blocks = max(0, (target_total - covered_host_hs) // self.block_size)
 
-        saved_ms = self.estimate_prefill_saved_ms(local_tokens, target_total, active_gpu_prefills)
+        saved_ms = self.estimate_prefill_saved_ms(
+            local_tokens, target_total, active_gpu_prefills, prompt_tokens=prompt_tokens
+        )
         restore_ms = self.estimate_restore_ms(ext_kv_blocks, ext_hs_blocks)
+        if record_stats:
+            self.gate_eval_calls += 1
+            self.gate_eval_time_us += (time.perf_counter() - t_gate0) * 1e6
 
         if restore_ms * self.restore_safety_margin < saved_ms:
             if record_stats:
@@ -560,6 +599,7 @@ class OnlineCostGate:
         host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
+        prompt_tokens: int | None = None,
     ) -> int:
         """Non-mutating pre-lookup gate used to skip pointless Mooncake RPCs."""
         return self._evaluate_external_tokens(
@@ -570,6 +610,7 @@ class OnlineCostGate:
             host_hs_tokens=host_hs_tokens,
             enable_cost_gate=enable_cost_gate,
             active_gpu_prefills=active_gpu_prefills,
+            prompt_tokens=prompt_tokens,
             record_stats=False,
         )
 
@@ -583,6 +624,7 @@ class OnlineCostGate:
         host_hs_tokens: int | None = None,
         enable_cost_gate: bool,
         active_gpu_prefills: int = 0,
+        prompt_tokens: int | None = None,
     ) -> int:
         """Return optimal total cached token target ``>= local_tokens``."""
         return self._evaluate_external_tokens(
@@ -593,6 +635,7 @@ class OnlineCostGate:
             host_hs_tokens=host_hs_tokens,
             enable_cost_gate=enable_cost_gate,
             active_gpu_prefills=active_gpu_prefills,
+            prompt_tokens=prompt_tokens,
             record_stats=True,
         )
 
@@ -616,6 +659,7 @@ class UnifiedPrefixDirectory:
         self.max_sketch_entries = max_sketch_entries
 
         self.step_seq = 0
+        self.state_version = 0
         self._roots: dict[bytes, PrefixNode] = {}
         self._nodes: dict[bytes, PrefixNode] = {}
         self._sketch: OrderedDict[bytes, int] = OrderedDict()
@@ -703,28 +747,37 @@ class UnifiedPrefixDirectory:
                 self._shadow_host_hs[key] = bsize
                 self._shadow_host_hs_bytes += bsize
             node.host_hs = True
+        self.state_version += 1
 
     def reconcile_worker_meta(self, meta: CoStateWorkerMetadata) -> None:
+        changed = False
         for raw in meta.host_hs_added:
             key = bytes(raw)
             if (node := self._nodes.get(key)) is not None:
                 node.host_hs = True
+                changed = True
         for raw in meta.host_hs_evicted:
             key = bytes(raw)
             if (ev := self._shadow_host_hs.pop(key, None)) is not None:
                 self._shadow_host_hs_bytes -= ev
+                changed = True
             if (node := self._nodes.get(key)) is not None:
                 node.host_hs = False
+                changed = True
         for raw in meta.store_kv_saved:
             key = bytes(raw)
             if (node := self._nodes.get(key)) is not None and not node.store_kv:
                 node.store_kv = True
                 self.store_bytes_used += self.kv_block_bytes
+                changed = True
         for raw in meta.store_hs_saved:
             key = bytes(raw)
             if (node := self._nodes.get(key)) is not None and not node.store_hs:
                 node.store_hs = True
                 self.store_bytes_used += self.hs_block_bytes
+                changed = True
+        if changed:
+            self.state_version += 1
 
     def contiguous_hs_tokens(self, block_hashes: Sequence[bytes]) -> int:
         """Longest contiguous prefix whose HS is available in HostHSCache or Store."""
@@ -792,6 +845,7 @@ class UnifiedPrefixDirectory:
             if idx < joint_blocks and not node.store_hs:
                 node.store_hs = True
                 self.store_bytes_used += self.hs_block_bytes
+        self.state_version += 1
 
     def _node_store_bytes(self, node: PrefixNode) -> int:
         total = 0
@@ -949,7 +1003,10 @@ class UnifiedPrefixDirectory:
             accepted_blocks += 1
 
         if new_kv_blocks == 0 and new_hs_blocks == 0:
+            if evicted_hashes:
+                self.state_version += 1
             return 0, 0, evicted_hashes
+        self.state_version += 1
         self.admitted_write_requests += 1
         save_kv_tokens = (accepted_blocks * self.block_size) if new_kv_blocks > 0 else 0
         save_hs_tokens = (accepted_blocks * self.block_size) if (want_hs and new_hs_blocks > 0) else 0

@@ -62,6 +62,7 @@ class StagePaceConfig:
 
     # Mechanism 2: Stage 0/1 Reuse-State & Remaining-Work Ordering + Talker K-step Coalescing
     enable_work_aware_reorder: bool = True
+    cache_blind_sjf: bool = False
     enable_talker_slack_coalesce: bool = True
     talker_min_batch: int = 2
     talker_min_running: int = 1
@@ -114,6 +115,7 @@ class StagePaceConfig:
             enable_work_aware_reorder=bool(
                 cfg.get("enable_work_aware_reorder", defaults.enable_work_aware_reorder)
             ),
+            cache_blind_sjf=bool(cfg.get("cache_blind_sjf", defaults.cache_blind_sjf)),
             enable_talker_slack_coalesce=bool(
                 cfg.get("enable_talker_slack_coalesce", defaults.enable_talker_slack_coalesce)
             ),
@@ -395,6 +397,10 @@ class SlackBatchController:
         self.config = config
         # Stage 0 / Stage 1 work-aware queue ordering diagnostics
         self.waiting_reorders = 0
+        self.reorder_calls = 0
+        self.reorder_cpu_time_us = 0.0
+        self.explicit_costate_queries = 0
+        self.chunked_prefill_budget_waits = 0
         # Stage 1 Talker diagnostics
         self.talker_deferrals = 0
         self.talker_urgent_bypasses = 0
@@ -429,29 +435,28 @@ class SlackBatchController:
         waiting_reqs: Sequence[Any],
         *,
         stage_id: int,
-        seen_hashes: set[bytes],
+        seen_hashes: set[bytes] | None = None,
         block_size: int = 16,
         is_stage_zero_final_fn: Any = None,
+        estimate_cached_tokens_fn: Any = None,
         ready_ts_map: dict[str, float] | None = None,
         now_wall: float | None = None,
     ) -> list[Any]:
         """Mechanism 2A: Reuse-state and remaining-work-aware waiting queue ordering (SRPT + Aging).
 
         - On Stage 0 (Thinker): estimates each waiting request's uncached remaining prefill
-          tokens using ``seen_hashes`` (prefix blocks already computed on Stage 0) and applies
-          a fast-lane priority weight to Text-only requests (``final_stage_id == 0``). This
-          prevents 20-token CoState prefix-cache hits and fast Text-only turns from being
-          head-of-line blocked behind 5000-token cold misses while sharing the same 4096-token
-          chunked-prefill batch.
+          tokens from explicit CoState/BlockPool reuse ``k*`` (or ``seen_hashes`` fallback)
+          and applies a priority weight to Text-only requests (``final_stage_id == 0``).
+          When ``cache_blind_sjf=True``, ignores cached tokens and orders by raw prompt length.
         - On Stage 1 (Talker): orders ready chunk-0 requests by remaining Talker prompt tokens
-          with anti-starvation aging so short hot utterances are not trapped behind a giant
-          cold Talker prefill.
+          with anti-starvation aging so short hot utterances drain and release KV quickly.
         """
         cfg = self.config
         reqs = list(waiting_reqs)
         if len(reqs) <= 1 or not cfg.enabled or not cfg.enable_work_aware_reorder:
             return reqs
 
+        t_cpu0 = time.perf_counter()
         t_wall = time.time() if now_wall is None else now_wall
         bsize = max(1, int(block_size))
         scored: list[tuple[float, int, Any]] = []
@@ -463,15 +468,21 @@ class SlackBatchController:
             computed = int(getattr(req, "num_computed_tokens", 0) or 0)
 
             if stage_id == 0:
-                est_cached = computed
-                if seen_hashes:
-                    bhashes = getattr(req, "block_hashes", None) or ()
-                    matched_blks = 0
-                    for bh in bhashes:
-                        if bytes(bh) not in seen_hashes:
-                            break
-                        matched_blks += 1
-                    est_cached = max(est_cached, matched_blks * bsize)
+                if cfg.cache_blind_sjf:
+                    est_cached = 0
+                elif callable(estimate_cached_tokens_fn):
+                    self.explicit_costate_queries += 1
+                    est_cached = max(computed, int(estimate_cached_tokens_fn(req) or 0))
+                else:
+                    est_cached = computed
+                    if seen_hashes:
+                        bhashes = getattr(req, "block_hashes", None) or ()
+                        matched_blks = 0
+                        for bh in bhashes:
+                            if bytes(bh) not in seen_hashes:
+                                break
+                            matched_blks += 1
+                        est_cached = max(est_cached, matched_blks * bsize)
                 rem_tokens = max(bsize, prompt_len - est_cached)
                 is_text = bool(is_stage_zero_final_fn(req)) if callable(is_stage_zero_final_fn) else False
                 mod_weight = 0.30 if (is_text and cfg.enable_text_fastlane) else 1.0
@@ -496,6 +507,8 @@ class SlackBatchController:
 
         scored.sort(key=lambda item: (item[0], item[1]))
         ordered = [item[2] for item in scored]
+        self.reorder_calls += 1
+        self.reorder_cpu_time_us += (time.perf_counter() - t_cpu0) * 1e6
         if any(a is not b for a, b in zip(ordered, reqs)):
             self.waiting_reorders += 1
         return ordered
@@ -667,6 +680,14 @@ class SlackBatchController:
         )
         return {
             "waiting_reorders": self.waiting_reorders,
+            "reorder_calls": self.reorder_calls,
+            "mean_reorder_cpu_us": (
+                round(self.reorder_cpu_time_us / self.reorder_calls, 2)
+                if self.reorder_calls > 0
+                else 0.0
+            ),
+            "explicit_costate_queries": self.explicit_costate_queries,
+            "chunked_prefill_budget_waits": self.chunked_prefill_budget_waits,
             "talker_deferrals": self.talker_deferrals,
             "talker_urgent_bypasses": self.talker_urgent_bypasses,
             "talker_target_batch_admissions": self.talker_target_batch_admissions,

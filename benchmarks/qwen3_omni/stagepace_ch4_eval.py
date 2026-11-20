@@ -43,12 +43,21 @@ from benchmarks.qwen3_omni.costate_ch3_eval import (
 from tests.engine import kv_offload_helpers as helpers
 
 CACHE_MODES = ("local_only", "pr10107", "costate")
-PACE_MODES = ("f0_baseline", "f1_static", "stagepace_m1", "stagepace_full")
+PACE_MODES = (
+    "f0_baseline",
+    "f1_static",
+    "tuned_native",
+    "cache_blind_sjf",
+    "stagepace_m1",
+    "stagepace_m1_m2a",
+    "stagepace_m1_m2ab",
+    "stagepace_full",
+)
 
 
 def build_stagepace_dict(args) -> dict:
     mode = args.pace_mode
-    if mode == "f0_baseline":
+    if mode in ("f0_baseline", "tuned_native"):
         return {"enabled": False}
     if mode == "f1_static":
         # Naive global admission limit without Text-only fast-lane or work-aware ordering
@@ -66,23 +75,7 @@ def build_stagepace_dict(args) -> dict:
             "enable_talker_slack_coalesce": False,
             "enable_code2wav_dual_slack": False,
         }
-    if mode == "stagepace_m1":
-        # Mechanism 1: Real-time Talker KV watermark + pipelined admission cap + Text-only fast-lane + EDF
-        return {
-            "enabled": True,
-            "enable_backpressure": True,
-            "enable_text_fastlane": True,
-            "enable_edf_queue": True,
-            "talker_max_inflight_reqs": args.talker_max_inflight,
-            "talker_kv_high_watermark": args.talker_kv_high_wm,
-            "talker_kv_low_watermark": args.talker_kv_low_wm,
-            "talker_kv_token_capacity": args.talker_kv_token_cap,
-            "default_ttfa_slo_ms": args.ttfa_slo_ms,
-            "enable_work_aware_reorder": False,
-            "enable_talker_slack_coalesce": False,
-            "enable_code2wav_dual_slack": False,
-        }
-    return {
+    base = {
         "enabled": True,
         "enable_backpressure": True,
         "enable_text_fastlane": True,
@@ -92,18 +85,37 @@ def build_stagepace_dict(args) -> dict:
         "talker_kv_low_watermark": args.talker_kv_low_wm,
         "talker_kv_token_capacity": args.talker_kv_token_cap,
         "default_ttfa_slo_ms": args.ttfa_slo_ms,
-        "enable_work_aware_reorder": True,
-        "enable_talker_slack_coalesce": True,
+        "enable_work_aware_reorder": False,
+        "cache_blind_sjf": False,
+        "enable_talker_slack_coalesce": False,
         "talker_min_batch": 2,
         "talker_min_running": 1,
         "talker_max_wait_ms": 22.0,
         "talker_min_defer_slack_ms": 140.0,
-        "enable_code2wav_dual_slack": True,
+        "enable_code2wav_dual_slack": False,
         "code2wav_target_batch": 4,
         "code2wav_max_wait_ms": 18.0,
         "code2wav_express_slack_threshold_ms": 120.0,
         "code2wav_continuation_guard_ms": 150.0,
     }
+    if mode == "stagepace_m1":
+        return base
+    if mode == "cache_blind_sjf":
+        base["enable_work_aware_reorder"] = True
+        base["cache_blind_sjf"] = True
+        return base
+    if mode == "stagepace_m1_m2a":
+        base["enable_work_aware_reorder"] = True
+        return base
+    if mode == "stagepace_m1_m2ab":
+        base["enable_work_aware_reorder"] = True
+        base["enable_talker_slack_coalesce"] = True
+        return base
+    # stagepace_full
+    base["enable_work_aware_reorder"] = True
+    base["enable_talker_slack_coalesce"] = True
+    base["enable_code2wav_dual_slack"] = True
+    return base
 
 
 def build_deployment(args, namespace: str) -> dict:
@@ -152,13 +164,28 @@ def build_deployment(args, namespace: str) -> dict:
             )
         thinker["omni_kv_config"] = {"kv_store_config": {"mooncake_config": mc_cfg}}
 
+    talker_add: dict = {"stagepace": sp_cfg}
+    code2wav_add: dict = {"stagepace": sp_cfg}
+    if args.pace_mode == "tuned_native":
+        talker_add.update(
+            ar_prefill_admission_min_batch=2,
+            ar_prefill_admission_max_wait_ms=22.0,
+            ar_prefill_admission_min_running=1,
+        )
+        code2wav_add.update(
+            generation_min_batch_size=4,
+            generation_max_wait_ms=18.0,
+            generation_first_chunk_express=True,
+            generation_first_chunk_express_min_slack_s=0.15,
+        )
+
     talker: dict = {
         "max_num_seqs": max_seqs,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": 0.35,
         "revision": REVISION,
         "subtalker_sampling_params": {"do_sample": False},
-        "additional_config": {"stagepace": sp_cfg},
+        "additional_config": talker_add,
     }
     if args.talker_kv_mib > 0:
         talker["kv_cache_memory_bytes"] = args.talker_kv_mib * 1024**2
@@ -167,7 +194,7 @@ def build_deployment(args, namespace: str) -> dict:
         "max_num_seqs": max_seqs,
         "gpu_memory_utilization": 0.20,
         "revision": REVISION,
-        "additional_config": {"stagepace": sp_cfg},
+        "additional_config": code2wav_add,
     }
 
     return helpers.stage_overrides(

@@ -210,9 +210,8 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
     )
     assert chosen_audio_512 == 512
 
-    # 2. At 4096 tokens (256 blocks), Audio WITHOUT HostHSCache (must read/deserialize HS from L2)
-    #    is slower than 3B MoE prefill -> bypass; WITH HostHSCache (Cut #4: L2 pure-KV + RAM HS)
-    #    it skips L2 HS deserialization completely and beats MoE prefill by 2x -> restore!
+    # 2. At 4096 tokens (256 blocks), end-to-end L2 restore (~156-208 ms) does NOT beat
+    #    3B-active MoE GPU prefill (~164 ms) within safety margin -> bypasses L2 cleanly!
     chosen_audio_4k_cold_host = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=4096,
@@ -229,10 +228,18 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         host_hs_tokens=4096,
         enable_cost_gate=True,
     )
-    assert chosen_audio_4k_warm_host == 4096
+    assert chosen_audio_4k_warm_host == 0
 
-    # 3. At 8192 tokens (512 blocks), quadratic Attention makes idle L2 (c=1) beat cold prefill -> restore;
-    #    second concurrent reader sees active_read_count == 1 -> bypasses to prevent TCP contention inversion!
+    # 3. At 6144-8192 tokens (384-512 blocks), quadratic Attention makes L2 restore beat cold prefill!
+    chosen_6k_pure_kv = gate.select_external_tokens(
+        local_tokens=0,
+        candidate_total_tokens=6144,
+        is_text_only=False,
+        host_hs_tokens=6144,
+        enable_cost_gate=True,
+    )
+    assert chosen_6k_pure_kv == 6144
+
     chosen_8k_first = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=8192,
@@ -241,7 +248,7 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         enable_cost_gate=True,
     )
     assert chosen_8k_first == 8192
-    gate.reserve_read("req-first", 8192)
+    gate.reserve_read("req-first", 8192, ext_kv_blocks=512, now_perf=100.0)
 
     chosen_8k_second = gate.select_external_tokens(
         local_tokens=0,
@@ -251,6 +258,13 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         enable_cost_gate=True,
     )
     assert chosen_8k_second == 0
+
+    # End-to-end scheduler-side read span updates EMA cleanly
+    sample_ms_per_blk = gate.complete_read("req-first", now_perf=100.320)
+    assert sample_ms_per_blk is not None
+    gate.update_ema([sample_ms_per_blk], [])
+    assert gate.ema_kv_ms_per_block > 0.50
+    assert gate.gate_eval_calls > 0
 
     # 4. Single-flight non-interfering L2 write admission
     assert gate.can_admit_store_write(active_gpu_prefills=1)

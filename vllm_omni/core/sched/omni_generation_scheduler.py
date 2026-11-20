@@ -73,6 +73,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        additional = getattr(vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
         self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
         self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
