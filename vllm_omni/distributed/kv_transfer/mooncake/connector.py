@@ -1821,9 +1821,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        if self._costate_gate is not None:
-            g = self._costate_gate
-            d = self._costate_dir
+        g = getattr(self, "_cost_gate", None)
+        if g is not None:
+            d = getattr(self, "_costate_dir", None)
             summary = {
                 "gate_eval_calls": g.gate_eval_calls,
                 "mean_gate_eval_us": round(g.gate_eval_time_us / g.gate_eval_calls, 2) if g.gate_eval_calls > 0 else 0.0,

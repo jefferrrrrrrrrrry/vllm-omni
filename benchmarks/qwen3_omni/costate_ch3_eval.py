@@ -283,9 +283,10 @@ def deployment(
     enable_cost_gate: bool = True,
 ) -> dict:
     enable_local = mode in ("local_only", "pr10491", "costate")
+    worker_mod = "costate_ch3_eval_pr10491" if mode == "pr10491" else "benchmarks.qwen3_omni.costate_ch3_eval"
     thinker: dict = {
         "use_v2_model_runner": True,
-        "worker_cls": "benchmarks.qwen3_omni.costate_ch3_eval.CoStateEvalWorker",
+        "worker_cls": f"{worker_mod}.CoStateEvalWorker",
         "tensor_parallel_size": 1,
         "max_num_seqs": max_concurrency,
         "max_model_len": max_model_len,
