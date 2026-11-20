@@ -465,46 +465,46 @@ async def fetch_worker_snapshot(omni, *, reset_chains: bool = False, include_aud
     )
 
 
-def build_e2e_serving_trace(seed: int = 42) -> list[dict]:
-    """Build a deterministic 60-request mixed multi-turn + cold-noise omni workload.
+def build_e2e_serving_trace(seed: int = 42, num_requests: int = 60) -> list[dict]:
+    """Build a deterministic mixed multi-turn + cold-noise omni workload.
 
-    Working set structure:
+    Working set structure (per 60-request block, scaled proportionally for num_requests):
     - 2 shared domain system roots (~1024 tokens each)
     - 8 session branches extending the roots to ~2048 and ~3584 tokens across turns
       (Zipf-skewed so hot sessions repeat 5-7x while cold branches repeat 2x)
-    - 25% (15/60) one-off cold noise documents (~4096 and ~8192 tokens) that never
+    - 25% one-off cold noise documents (~4096 and ~8192 tokens) that never
       repeat, testing cold-write overhead, 2-Hit admission, and zombie-block safety
     - 60% Audio-output turns + 40% Text-only turns sharing prefixes
     """
     rng = random.Random(seed)
-    # 8 session specs: (root_id, branch_id, branch_extra_toks, weight) -> sum(weights) == 45
+    scale = max(1, (num_requests + 59) // 60)
+    # 8 session specs: (root_id, branch_id, branch_extra_toks, weight) -> sum(weights) == 45 * scale
     families = [
-        ("sysA", "sess0", 1024, 9),
-        ("sysA", "sess1", 1024, 8),
-        ("sysA", "sess2", 2560, 7),
-        ("sysB", "sess3", 1024, 7),
-        ("sysB", "sess4", 2560, 6),
-        ("sysB", "sess5", 1024, 4),
-        ("sysA", "sess6", 2560, 2),
-        ("sysB", "sess7", 2560, 2),
+        ("sysA", "sess0", 1024, 9 * scale),
+        ("sysA", "sess1", 1024, 8 * scale),
+        ("sysA", "sess2", 2560, 7 * scale),
+        ("sysB", "sess3", 1024, 7 * scale),
+        ("sysB", "sess4", 2560, 6 * scale),
+        ("sysB", "sess5", 1024, 4 * scale),
+        ("sysA", "sess6", 2560, 2 * scale),
+        ("sysB", "sess7", 2560, 2 * scale),
     ]
     hot_pool: list[tuple[str, str, int, int]] = []
     turn_counters = {f[1]: 0 for f in families}
     for root_id, branch_id, extra_toks, count in families:
         for _ in range(count):
             hot_pool.append((root_id, branch_id, extra_toks, 0))
-    assert len(hot_pool) == 45
     rng.shuffle(hot_pool)
 
     noise_specs = [
         ("noise4k", 4096) if i % 3 != 0 else ("noise8k", 8192)
-        for i in range(15)
+        for i in range(15 * scale)
     ]
 
-    # Interleave 45 multi-turn family requests and 15 one-off cold noise requests into 60 slots
+    # Interleave 75% multi-turn family requests and 25% one-off cold noise requests
     trace: list[dict] = []
     h_idx, n_idx = 0, 0
-    for slot in range(60):
+    for slot in range(num_requests):
         if slot % 4 == 2 and n_idx < len(noise_specs):
             ntag, nlen = noise_specs[n_idx]
             n_idx += 1
@@ -639,7 +639,7 @@ async def run_read_matrix_suite(omni, args, report: dict) -> None:
 
 
 async def run_e2e_serving_suite(omni, args, report: dict) -> None:
-    trace = build_e2e_serving_trace(seed=args.seed)
+    trace = build_e2e_serving_trace(seed=args.seed, num_requests=args.num_requests)
     wave_size = max(1, args.serving_concurrency)
     await fetch_worker_snapshot(omni, reset_chains=True, include_audit=False)
 
@@ -918,6 +918,7 @@ def main() -> None:
     parser.add_argument("--spill-sessions", type=int, default=4)
     parser.add_argument("--disable-host-hs", action="store_true")
     parser.add_argument("--disable-cost-gate", action="store_true")
+    parser.add_argument("--num-requests", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     asyncio.run(run_eval(args))

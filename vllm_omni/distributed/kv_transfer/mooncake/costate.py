@@ -360,9 +360,9 @@ def marginal_prefill_ms_per_block(depth: int) -> float:
     if depth < 128:
         return 0.45
     if depth < 256:
-        return 0.55
+        return 0.78
     if depth < 512:
-        return 1.15
+        return 1.05
     return 1.40
 
 
@@ -485,7 +485,7 @@ class OnlineCostGate:
         compute_ms = sum(marginal_prefill_ms_per_block(b) for b in range(start_blk, end_blk))
         rem_suffix = 0 if prompt_tokens is None else max(0, int(prompt_tokens) - end_tokens)
         if start_blk == 0 and rem_suffix < 64:
-            compute_ms += self.sparse_suffix_expert_saved_ms * min(1.0, (end_blk - start_blk) / 28.0)
+            compute_ms += self.sparse_suffix_expert_saved_ms * min(1.0, (end_blk - start_blk) / 64.0)
         return compute_ms * (1.0 + 0.32 * max(0, active_gpu_prefills))
 
     def estimate_restore_ms(

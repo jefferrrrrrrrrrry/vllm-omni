@@ -1834,7 +1834,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 "decisions_truncated_budget": g.decisions_truncated_budget,
                 "decisions_write_deferred": g.decisions_write_deferred,
                 "dir_nodes": len(d._nodes) if d is not None else 0,
-                "dir_store_bytes": d.store_bytes if d is not None else 0,
+                "dir_store_bytes": d.store_bytes_used if d is not None else 0,
             }
             logger.info("[CoState] scheduler summary: %s", summary)
         with self._lock:

@@ -35,14 +35,21 @@ from uuid import uuid4
 import pynvml
 import torch
 
-from benchmarks.qwen3_omni.costate_ch3_eval import (
-    REVISION,
-    build_scaled_prompt,
-    stats_dict,
-)
+try:
+    from benchmarks.qwen3_omni.costate_ch3_eval import (
+        REVISION,
+        build_scaled_prompt,
+        stats_dict,
+    )
+except ImportError:
+    from costate_ch3_eval_pr10491 import (
+        REVISION,
+        build_scaled_prompt,
+        stats_dict,
+    )
 from tests.engine import kv_offload_helpers as helpers
 
-CACHE_MODES = ("local_only", "pr10107", "costate")
+CACHE_MODES = ("local_only", "pr10107", "pr10491", "costate")
 PACE_MODES = (
     "f0_baseline",
     "f1_static",
@@ -120,7 +127,7 @@ def build_stagepace_dict(args) -> dict:
 
 def build_deployment(args, namespace: str) -> dict:
     sp_cfg = build_stagepace_dict(args)
-    enable_local = args.cache_mode in ("local_only", "costate")
+    enable_local = args.cache_mode in ("local_only", "pr10491", "costate")
     max_seqs = max(args.concurrency, 12)
 
     thinker: dict = {
@@ -138,8 +145,8 @@ def build_deployment(args, namespace: str) -> dict:
         "additional_config": {"stagepace": sp_cfg},
     }
 
-    if args.cache_mode in ("pr10107", "costate"):
-        assert args.store_config, "--store-config required for pr10107 / costate modes"
+    if args.cache_mode in ("pr10107", "pr10491", "costate"):
+        assert args.store_config, "--store-config required for pr10107 / pr10491 / costate modes"
         mc_cfg: dict[str, object] = {
             "config_file": str(Path(args.store_config).resolve()),
             "namespace": namespace,
@@ -149,6 +156,8 @@ def build_deployment(args, namespace: str) -> dict:
         if args.cache_mode == "pr10107":
             mc_cfg["max_hs_bytes"] = 256 * 1024 * 1024
             mc_cfg["enable_costate"] = False
+        elif args.cache_mode == "pr10491":
+            mc_cfg["max_hs_bytes"] = 1024 * 1024 * 1024
         else:
             mc_cfg.update(
                 max_hs_bytes=1024 * 1024 * 1024,
@@ -172,9 +181,9 @@ def build_deployment(args, namespace: str) -> dict:
             ar_prefill_admission_max_wait_ms=22.0,
             ar_prefill_admission_min_running=1,
         )
+        # Upstream OmniGenerationScheduler rejects generation_min_batch_size > 1 on
+        # non-MRV2 stages (Code2Wav V1 runner); enable all supported native knobs.
         code2wav_add.update(
-            generation_min_batch_size=4,
-            generation_max_wait_ms=18.0,
             generation_first_chunk_express=True,
             generation_first_chunk_express_min_slack_s=0.15,
         )
@@ -205,23 +214,24 @@ def build_deployment(args, namespace: str) -> dict:
 
 
 def build_stagepace_trace(*, num_requests: int, seed: int) -> list[dict]:
-    """Mixed high-concurrency Omni burst trace:
-    - 55% Hot Audio turns (1.6K-2.8K shared multi-turn prefixes -> high CoState hit slack)
-    - 25% Fast Text-only turns (1.6K shared prefixes -> tests fast-lane vs HOL blocking)
-    - 20% Cold Long Audio turns (4K-6K one-off prompts -> tight TTFA slack, tests urgent bypass)
+    """Mixed high-concurrency Omni burst trace with overlapping raw prompt lengths:
+    - 55% Hot Audio turns (2.4K-4.8K shared multi-turn prefixes -> long raw history, tiny suffix compute)
+    - 25% Fast Text-only turns (2.4K-4.8K shared prefixes -> tests fast-lane vs HOL blocking)
+    - 20% Cold Audio turns (1.6K-4.8K one-off prompts -> overlapping raw lengths, heavy full prefill)
     """
     rng = random.Random(seed)
     hot_sessions = [
-        ("sp-hot-0", 1600),
-        ("sp-hot-1", 2048),
-        ("sp-hot-2", 2800),
-        ("sp-hot-3", 1600),
+        ("sp-hot-0", 2400),
+        ("sp-hot-1", 3200),
+        ("sp-hot-2", 4200),
+        ("sp-hot-3", 4800),
     ]
+    cold_lengths = {2: 1600, 7: 2400, 13: 4096, 18: 4800}
     trace: list[dict] = []
     for idx in range(num_requests):
         slot = idx % 20
-        if slot in (2, 7, 13, 18):
-            cold_len = 4096 if slot in (2, 13) else 6144
+        if slot in cold_lengths:
+            cold_len = cold_lengths[slot]
             trace.append(
                 {
                     "slot": idx,
@@ -495,8 +505,8 @@ def main() -> None:
     parser.add_argument("--max-store-mib", type=int, default=512)
     parser.add_argument("--host-hs-mib", type=int, default=256)
     parser.add_argument("--talker-max-inflight", type=int, default=12)
-    parser.add_argument("--talker-kv-high-wm", type=float, default=0.92)
-    parser.add_argument("--talker-kv-low-wm", type=float, default=0.80)
+    parser.add_argument("--talker-kv-high-wm", type=float, default=0.85)
+    parser.add_argument("--talker-kv-low-wm", type=float, default=0.72)
     parser.add_argument("--talker-kv-token-cap", type=int, default=0)
     parser.add_argument("--ttfa-slo-ms", type=float, default=750.0)
     parser.add_argument("--cold-ttfa-slo-ms", type=float, default=1200.0)

@@ -200,7 +200,7 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         max_pending_transfers=8,
     )
 
-    # 1. At 512 tokens (32 blocks), fixed prefill launch amortization beats tiny L2 read -> restore!
+    # 1. At 512-2048 tokens (32-128 blocks), L2 restore RPC + copy overhead exceeds MoE prefill -> bypass!
     chosen_audio_512 = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=512,
@@ -208,10 +208,20 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         host_hs_covers_local=False,
         enable_cost_gate=True,
     )
-    assert chosen_audio_512 == 512
+    assert chosen_audio_512 == 0
 
-    # 2. At 4096 tokens (256 blocks), end-to-end L2 restore (~156-208 ms) does NOT beat
-    #    3B-active MoE GPU prefill (~164 ms) within safety margin -> bypasses L2 cleanly!
+    chosen_audio_2k_warm = gate.select_external_tokens(
+        local_tokens=0,
+        candidate_total_tokens=2048,
+        is_text_only=False,
+        host_hs_tokens=2048,
+        enable_cost_gate=True,
+    )
+    assert chosen_audio_2k_warm == 0
+
+    # 2. At 4096 tokens (256 blocks), tier-aware crossover:
+    #    - Cold HostHS (must pull KV+HS from L2, ~224 ms) does NOT beat MoE prefill (~193 ms) -> bypass!
+    #    - Warm HostHS (pure-KV L2 read, ~169 ms) beats MoE prefill (~193 ms) -> restore!
     chosen_audio_4k_cold_host = gate.select_external_tokens(
         local_tokens=0,
         candidate_total_tokens=4096,
@@ -228,7 +238,7 @@ def test_online_cost_gate_modality_and_congestion_decisions() -> None:
         host_hs_tokens=4096,
         enable_cost_gate=True,
     )
-    assert chosen_audio_4k_warm_host == 0
+    assert chosen_audio_4k_warm_host == 4096
 
     # 3. At 6144-8192 tokens (384-512 blocks), quadratic Attention makes L2 restore beat cold prefill!
     chosen_6k_pure_kv = gate.select_external_tokens(
